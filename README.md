@@ -141,7 +141,7 @@ How a type is chosen:
         "cbs:ModifyDiskAttributes", "cbs:CreateSnapshot", "cbs:DescribeSnapshots",
         "vpc:DescribeSecurityGroups", "vpc:CreateSecurityGroupWithPolicies",
         "vpc:CreateSecurityGroupPolicies", "vpc:CreateDefaultVpc",
-        "tag:TagResources"
+        "tag:*"
       ],
       "resource": ["*"]
     }
