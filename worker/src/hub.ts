@@ -157,6 +157,8 @@ export class Hub extends DurableObject<Env> {
 	private readonly activityWrites = new Map<string, number>();
 	/** Login flows in progress; they keep the VM from idling out. */
 	private readonly activeLogins = new Set<string>();
+	/** Set while a reconcile pass runs: the changes `updateCloud` made since the pass loaded its copy. */
+	private concurrentCloudChanges: Array<(cloud: CloudState) => void> | undefined;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -195,6 +197,17 @@ export class Hub extends DurableObject<Env> {
 
 	private saveCloud(cloud: CloudState): void {
 		this.putJson("cloud", cloud);
+	}
+
+	/**
+	 * The only write path outside reconcileOnce. A reconcile pass keeps its own copy across Tencent API calls; changes
+	 * made meanwhile are recorded and replayed onto that copy before it is saved, so the pass cannot overwrite them.
+	 */
+	private updateCloud(change: (cloud: CloudState) => void): void {
+		const cloud = this.loadCloud();
+		change(cloud);
+		this.saveCloud(cloud);
+		this.concurrentCloudChanges?.push(change);
 	}
 
 	private get localMode(): boolean {
@@ -446,27 +459,31 @@ export class Hub extends DurableObject<Env> {
 
 	/** Keeps a VM up for one idle period even without work, for example to warm it up. */
 	async startInstance(): Promise<void> {
-		const cloud = this.loadCloud();
-		cloud.manualUntil = Date.now() + this.settings().idleMinutes * 60_000;
-		cloud.idleSince = undefined;
-		this.saveCloud(cloud);
+		const until = Date.now() + this.settings().idleMinutes * 60_000;
+		this.updateCloud((cloud) => {
+			cloud.manualUntil = until;
+			cloud.idleSince = undefined;
+		});
 		this.log("info", "manual start requested");
 		await this.ensureAlarm(0);
 	}
 
 	/** Drains and terminates the VM now; work in progress resumes on the next VM. */
 	async stopInstance(): Promise<void> {
-		const cloud = this.loadCloud();
-		cloud.manualUntil = undefined;
-		if (cloud.instance && cloud.instance.phase !== "draining") {
-			if (this.sendToAgent({ t: "shutdown", reason: "manual stop" })) {
-				cloud.instance.phase = "draining";
-				cloud.instance.drainStartedAt = Date.now();
+		const now = Date.now();
+		const target = this.loadCloud().instance;
+		const sent = target !== undefined && target.phase !== "draining" && this.sendToAgent({ t: "shutdown", reason: "manual stop" });
+		this.updateCloud((cloud) => {
+			cloud.manualUntil = undefined;
+			const instance = cloud.instance;
+			if (!instance || instance.id !== target?.id || instance.phase === "draining") return;
+			if (sent) {
+				instance.phase = "draining";
+				instance.drainStartedAt = now;
 			} else {
-				this.retire(cloud, cloud.instance, "manual stop", Date.now());
+				this.retire(cloud, instance, "manual stop", now);
 			}
-		}
-		this.saveCloud(cloud);
+		});
 		this.log("info", "manual stop requested");
 		await this.ensureAlarm(0);
 	}
@@ -564,11 +581,10 @@ export class Hub extends DurableObject<Env> {
 			this.sendToUis({ t: "login_done", loginId, ok: false, error: "the agent disconnected" });
 		}
 		this.activeLogins.clear();
-		const cloud = this.loadCloud();
-		if (cloud.instance?.id === attachment.instanceId) {
-			cloud.instance.disconnectedAt = Date.now();
-			this.saveCloud(cloud);
-		}
+		const now = Date.now();
+		this.updateCloud((cloud) => {
+			if (cloud.instance?.id === attachment.instanceId) cloud.instance.disconnectedAt ??= now;
+		});
 		await this.ensureAlarm(15_000);
 	}
 
@@ -628,14 +644,13 @@ export class Hub extends DurableObject<Env> {
 					ws.close(4001, "protocol mismatch");
 					return;
 				}
-				const cloud = this.loadCloud();
-				if (cloud.instance?.id === instanceId) {
+				this.updateCloud((cloud) => {
+					if (cloud.instance?.id !== instanceId) return;
 					cloud.instance.connectedAt = now;
 					cloud.instance.disconnectedAt = undefined;
 					if (cloud.instance.phase !== "draining") cloud.instance.phase = "running";
 					if (cloud.disk) cloud.disk.formatted = true;
-					this.saveCloud(cloud);
-				}
+				});
 				const aborts = this.sql
 					.exec<{ id: string }>("SELECT id FROM sessions WHERE pending_abort = 1 AND archived = 0")
 					.toArray()
@@ -680,23 +695,24 @@ export class Hub extends DurableObject<Env> {
 				this.sql.exec("UPDATE sessions SET pending_abort = 0 WHERE id = ?", message.sessionId);
 				return;
 			case "reclaim": {
-				const cloud = this.loadCloud();
-				if (cloud.instance?.id === instanceId) {
-					const deadline = Date.parse(message.terminationTime);
+				if (this.loadCloud().instance?.id !== instanceId) return;
+				const parsed = Date.parse(message.terminationTime);
+				const deadline = Number.isNaN(parsed) ? now + 120_000 : parsed;
+				this.updateCloud((cloud) => {
+					if (cloud.instance?.id !== instanceId) return;
 					cloud.cooldown[`${cloud.instance.zone}/${cloud.instance.type}`] = now + COOLDOWN_MS;
-					this.retire(cloud, cloud.instance, "spot reclaim", now, Number.isNaN(deadline) ? now + 120_000 : deadline);
-					this.saveCloud(cloud);
-					this.log("warn", `spot reclaim notice for ${instanceId} at ${message.terminationTime}; launching a replacement`);
-					await this.reconcile();
-				}
+					this.retire(cloud, cloud.instance, "spot reclaim", now, deadline);
+				});
+				this.log("warn", `spot reclaim notice for ${instanceId} at ${message.terminationTime}; launching a replacement`);
+				await this.reconcile();
 				return;
 			}
 			case "stopped": {
-				const cloud = this.loadCloud();
-				if (cloud.instance?.id === instanceId) this.retire(cloud, cloud.instance, message.reason, now);
-				const retired = cloud.retired.find((r) => r.id === instanceId);
-				if (retired) retired.stopped = true;
-				this.saveCloud(cloud);
+				this.updateCloud((cloud) => {
+					if (cloud.instance?.id === instanceId) this.retire(cloud, cloud.instance, message.reason, now);
+					const retired = cloud.retired.find((r) => r.id === instanceId);
+					if (retired) retired.stopped = true;
+				});
 				this.log("info", `agent ${instanceId} stopped (${message.reason})`);
 				await this.reconcile();
 				return;
@@ -856,7 +872,9 @@ export class Hub extends DurableObject<Env> {
 	}
 
 	private retire(cloud: CloudState, instance: InstanceRecord, reason: string, now: number, terminateAfter = now): void {
-		cloud.retired.push({ id: instance.id, token: instance.token, reason, at: now, terminateAfter, stopped: false });
+		if (!cloud.retired.some((r) => r.id === instance.id)) {
+			cloud.retired.push({ id: instance.id, token: instance.token, reason, at: now, terminateAfter, stopped: false });
+		}
 		cloud.instance = undefined;
 		cloud.idleSince = undefined;
 	}
@@ -871,6 +889,7 @@ export class Hub extends DurableObject<Env> {
 			return;
 		}
 		const settings = this.settings();
+		this.concurrentCloudChanges = [];
 		try {
 			const tc = this.tencent();
 			const instances = await describeTaggedInstances(tc, TAG_KEY, this.namePrefix);
@@ -885,6 +904,8 @@ export class Hub extends DurableObject<Env> {
 			this.log("error", `reconcile: ${errorMessage(error)}`);
 		}
 		for (const [key, until] of Object.entries(cloud.cooldown)) if (until < now) delete cloud.cooldown[key];
+		for (const change of this.concurrentCloudChanges) change(cloud);
+		this.concurrentCloudChanges = undefined;
 		this.saveCloud(cloud);
 		this.scheduleBroadcast();
 

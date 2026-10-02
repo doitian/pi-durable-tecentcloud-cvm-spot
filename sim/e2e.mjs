@@ -74,7 +74,7 @@ const step = (message) => console.log(`\n== ${message}`);
 
 async function main() {
 	start("sim", process.execPath, [join(root, "sim/tencent-sim.mjs")], {
-		env: { ...process.env, SIM_HUB_URL: HUB, SIM_DATA_DIR: join(scratch, "data") },
+		env: { ...process.env, SIM_HUB_URL: HUB, SIM_DATA_DIR: join(scratch, "data"), SIM_LATENCY_MS: "400" },
 	});
 	const vars = {
 		CLOUD_MODE: "tencent",
@@ -136,6 +136,12 @@ async function main() {
 	}, 150_000);
 	await waitFor("task C answered", async () => (await answers(created.id)) >= 4, 90_000);
 	console.log(`ok: ${third.id} lost, ${fourth.id} finished the run`);
+
+	step("Stop VM terminates the instance promptly instead of waiting for the drain timeout");
+	const stopRequested = Date.now();
+	await api("/instance/stop", { method: "POST" });
+	await waitFor("instance terminated after stop", async () => (await simState()).instances.length === 0, 75_000);
+	console.log(`ok: terminated ${Math.round((Date.now() - stopRequested) / 1000)}s after Stop VM`);
 
 	console.log("\nPASS");
 }

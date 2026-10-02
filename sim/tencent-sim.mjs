@@ -15,6 +15,8 @@ const PORT = Number(process.env.SIM_PORT ?? 8790);
 const HUB_URL = process.env.SIM_HUB_URL ?? "http://127.0.0.1:8787";
 const DATA_DIR = process.env.SIM_DATA_DIR ?? join(root, ".local-data");
 const RECLAIM_NOTICE_MS = Number(process.env.SIM_RECLAIM_NOTICE_MS ?? 70_000);
+// The real API answers in a few hundred milliseconds; races in the Hub only show up with comparable latency.
+const LATENCY_MS = Number(process.env.SIM_LATENCY_MS ?? 0);
 
 const instances = new Map();
 const disks = new Map();
@@ -264,6 +266,7 @@ createServer(async (req, res) => {
 		return send(200, { Response: { Error: { Code: "AuthFailure.SignatureFailure", Message: "unsigned" } } });
 	}
 	const handler = handlers[action];
+	if (LATENCY_MS > 0) await new Promise((resolve) => setTimeout(resolve, LATENCY_MS));
 	try {
 		if (!handler) fail("InvalidAction", `${action} is not simulated`);
 		send(200, { Response: { ...handler(JSON.parse(body || "{}")), RequestId: newId("req") } });
