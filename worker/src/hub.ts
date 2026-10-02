@@ -49,6 +49,7 @@ const MIGRATE_AFTER_MS = 10 * 60_000;
 const VANISH_GRACE_MS = 90_000;
 const DEAD_STATES = new Set(["LAUNCH_FAILED", "SHUTDOWN", "TERMINATING", "STOPPED", "STOPPING"]);
 const MAX_ENTRY_BYTES = 1_500_000;
+const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const TRANSCRIPT_LIMIT = 400;
 
 export interface Settings {
@@ -63,6 +64,8 @@ export interface Settings {
 	archiveAfterMinutes: number | null;
 	bandwidthMbps: number;
 	defaultModel: string;
+	/** For new sessions that do not pick one; pi-durable itself defaults to "off". */
+	defaultThinkingLevel: ThinkingLevel | null;
 }
 
 interface InstanceRecord {
@@ -145,6 +148,12 @@ function parseModel(value: string): { provider: string; modelId: string } {
 	const slash = value.indexOf("/");
 	if (slash <= 0) throw new Error(`Model must look like provider/modelId, got "${value}"`);
 	return { provider: value.slice(0, slash), modelId: value.slice(slash + 1) };
+}
+
+function parseThinkingLevel(value: string | null | undefined): ThinkingLevel | null {
+	if (value === null || value === undefined || value === "") return null;
+	if (!THINKING_LEVELS.includes(value as ThinkingLevel)) throw new Error(`Unknown thinking level "${value}"`);
+	return value as ThinkingLevel;
 }
 
 function randomHex(bytes: number): string {
@@ -245,6 +254,7 @@ export class Hub extends DurableObject<Env> {
 			archiveAfterMinutes: env.ARCHIVE_AFTER_MINUTES === "" ? null : envNumber(env.ARCHIVE_AFTER_MINUTES, 30),
 			bandwidthMbps: envNumber(env.BANDWIDTH_MBPS, 100),
 			defaultModel: env.DEFAULT_MODEL || "anthropic/claude-sonnet-5",
+			defaultThinkingLevel: parseThinkingLevel(env.DEFAULT_THINKING_LEVEL ?? "medium"),
 		};
 	}
 
@@ -356,6 +366,7 @@ export class Hub extends DurableObject<Env> {
 				patch.archiveAfterMinutes === null || String(patch.archiveAfterMinutes) === "" ? null : Math.max(0, Number(patch.archiveAfterMinutes));
 		}
 		if (patch.bandwidthMbps !== undefined) next.bandwidthMbps = Math.max(1, Number(patch.bandwidthMbps));
+		if (patch.defaultThinkingLevel !== undefined) next.defaultThinkingLevel = parseThinkingLevel(patch.defaultThinkingLevel);
 		if (patch.defaultModel !== undefined) {
 			parseModel(patch.defaultModel);
 			next.defaultModel = patch.defaultModel;
@@ -388,7 +399,9 @@ export class Hub extends DurableObject<Env> {
 			model: parseModel(input.model?.trim() || settings.defaultModel),
 			...(input.repoUrl?.trim() ? { repoUrl: input.repoUrl.trim() } : {}),
 			...(input.branch?.trim() ? { branch: input.branch.trim() } : {}),
-			...(input.thinkingLevel ? { thinkingLevel: input.thinkingLevel } : {}),
+			...((input.thinkingLevel || settings.defaultThinkingLevel)
+				? { thinkingLevel: parseThinkingLevel(input.thinkingLevel || settings.defaultThinkingLevel)! }
+				: {}),
 			...(input.instructions?.trim() ? { instructions: input.instructions.trim() } : {}),
 		};
 		this.sql.exec(
@@ -430,15 +443,17 @@ export class Hub extends DurableObject<Env> {
 	}
 
 	/** Switches the model from the next request on; an offline session picks it up when the VM starts. */
-	async setSessionModel(sessionId: string, model: string): Promise<void> {
+	async updateSessionAgent(sessionId: string, change: { model?: string; thinkingLevel?: string }): Promise<void> {
 		const row = this.sql
 			.exec<{ spec: string }>("SELECT spec FROM sessions WHERE id = ? AND archived = 0", sessionId)
 			.toArray()[0];
 		if (!row) throw new Error("unknown session");
-		const spec: SessionSpec = { ...(JSON.parse(row.spec) as SessionSpec), model: parseModel(model) };
+		const spec: SessionSpec = JSON.parse(row.spec) as SessionSpec;
+		if (change.model) spec.model = parseModel(change.model);
+		if (change.thinkingLevel) spec.thinkingLevel = parseThinkingLevel(change.thinkingLevel)!;
 		this.sql.exec("UPDATE sessions SET spec = ? WHERE id = ?", JSON.stringify(spec), sessionId);
 		this.sendToAgent({ t: "session", session: spec });
-		this.log("info", `session "${spec.title}" now uses ${model}`);
+		this.log("info", `session "${spec.title}" now uses ${spec.model.provider}/${spec.model.modelId}, thinking ${spec.thinkingLevel ?? "off"}`);
 	}
 
 	/** Summarizes the session's older context now instead of waiting for automatic compaction. */

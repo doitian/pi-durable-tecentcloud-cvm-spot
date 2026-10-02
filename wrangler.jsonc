@@ -28,6 +28,7 @@
     "TENCENT_REGION": "ap-singapore",
     "NAME_PREFIX": "pi-spot",
     "DEFAULT_MODEL": "anthropic/claude-sonnet-5",
+    "DEFAULT_THINKING_LEVEL": "medium",
 
     // Spot instance selection; also editable at runtime from the control panel.
     "MIN_CPU": "2",

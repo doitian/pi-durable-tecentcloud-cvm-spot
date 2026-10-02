@@ -22,6 +22,8 @@ export interface Env {
 	TENCENT_API_ENDPOINT?: string;
 	NAME_PREFIX?: string;
 	DEFAULT_MODEL?: string;
+	/** Thinking level for new sessions that do not pick one: off, minimal, low, medium, high, xhigh or max. */
+	DEFAULT_THINKING_LEVEL?: string;
 	MIN_CPU?: string;
 	MIN_MEMORY_GB?: string;
 	MAX_HOURLY_PRICE?: string;

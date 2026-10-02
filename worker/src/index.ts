@@ -63,7 +63,7 @@ async function api(request: Request, url: URL, env: Env): Promise<Response> {
 			return json(await stub.resetSession(id, (await body<{ handoff?: string }>()).handoff));
 		}
 		if (method === "POST" && action === "/model") {
-			return json(await stub.setSessionModel(id, (await body<{ model: string }>()).model));
+			return json(await stub.updateSessionAgent(id, await body<{ model?: string; thinkingLevel?: string }>()));
 		}
 		if (method === "POST" && action === "/archive") return json(await stub.archiveSession(id));
 	}

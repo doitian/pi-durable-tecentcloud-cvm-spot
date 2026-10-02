@@ -138,7 +138,7 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
       <label class="wide">Git repository<input name="repoUrl" placeholder="https://github.com/owner/repo.git (optional)"></label>
       <label>Branch<input name="branch" placeholder="default branch"></label>
       <label>Model<input name="model" placeholder="provider/modelId" list="modelOptions"></label>
-      <label>Thinking<select name="thinkingLevel"><option value="">default</option><option>off</option><option>minimal</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option></select></label>
+      <label>Thinking<select name="thinkingLevel"><option value="">default (Settings)</option><option>off</option><option>minimal</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label>
       <label class="wide">Extra instructions<textarea name="instructions" rows="2"></textarea></label>
       <label class="wide">First prompt<textarea name="prompt" rows="4" placeholder="What should the agent do?"></textarea></label>
     </div>
@@ -157,6 +157,7 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
       <label>Zones<input name="zones" placeholder="all zones, e.g. ap-singapore-3,ap-singapore-4"></label>
       <label>Stop after idle (minutes)<input name="idleMinutes" type="number" min="1" step="1"></label>
       <label>Default model<input name="defaultModel" list="modelOptions"></label>
+      <label>Default thinking level<select name="defaultThinkingLevel"><option value="">off (pi-durable default)</option><option>minimal</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label>
       <label>Public bandwidth (Mbps)<input name="bandwidthMbps" type="number" min="1" step="1"></label>
       <label>Data disk size for a new disk (GB)<input name="dataDiskGb" type="number" min="20" step="10"></label>
       <label>Snapshot and delete the idle disk after (minutes)<input name="archiveAfterMinutes" type="number" min="0" step="5" placeholder="never"></label>
@@ -415,6 +416,7 @@ function renderHead() {
   head.replaceChildren(
     h("span", { class: "title" }, session.title),
     modelSwitcher(session),
+    thinkingSwitcher(session),
     h("span", { class: "meta" }, session.repoUrl ? `${session.repoUrl} · ` : "", label, session.costUsd ? ` · $${session.costUsd.toFixed(2)}` : ""),
     session.error ? h("span", { class: "meta", style: "color: var(--err)" }, session.error) : "",
     h("span", { class: "spacer" }),
@@ -443,18 +445,32 @@ function textOf(content) {
   return (content || []).map((block) => block.type === "text" ? block.text : block.type === "image" ? "[image]" : "").join("");
 }
 
-function renderAssistant(message, results, live, shown) {
+// Open/closed choices the user made, keyed per block, so the 50 ms re-renders while streaming keep them.
+const detailsChoice = new Map();
+
+function collapsible(key, className, summary, defaultOpen, ...body) {
+  const details = h("details", { class: className }, h("summary", {}, summary), ...body);
+  details.open = detailsChoice.has(key) ? detailsChoice.get(key) : defaultOpen;
+  details.firstChild.addEventListener("click", () => detailsChoice.set(key, !details.open));
+  return details;
+}
+
+function renderAssistant(message, results, live, shown, key, streaming) {
   const nodes = [];
-  for (const block of message.content || []) {
+  for (const [index, block] of (message.content || []).entries()) {
     if (!block) continue;
     if (block.type === "text" && block.text) nodes.push(h("div", { class: "msg assistant" }, block.text));
-    else if (block.type === "thinking" && block.thinking) nodes.push(h("details", { class: "msg thinking" }, h("summary", {}, "thinking"), h("pre", {}, block.thinking)));
+    else if (block.type === "thinking" && block.thinking) {
+      // The block still streaming stays open so the reasoning is visible as it arrives.
+      const open = streaming && !message.content.slice(index + 1).some(Boolean);
+      nodes.push(collapsible(`${key}:${index}`, "msg thinking", open ? "thinking…" : "thinking", open, h("pre", {}, block.thinking)));
+    }
     else if (block.type === "toolCall") {
       const result = results.get(block.id);
       const running = live.get(block.id);
       shown.add(block.id);
       const output = result ? textOf(result.content) : running ? running.output : null;
-      nodes.push(renderTool(block.name, block.arguments, output, result ? result.isError : false, !result));
+      nodes.push(renderTool(block.name, block.arguments, output, result ? result.isError : false, !result, block.id));
     }
   }
   if (message.errorMessage) nodes.push(h("div", { class: "msg error" }, message.errorMessage));
@@ -468,9 +484,9 @@ function argSummary(name, args) {
   return JSON.stringify(args);
 }
 
-function renderTool(name, args, output, isError, running) {
+function renderTool(name, args, output, isError, running, key) {
   const summary = `${running ? "⏳ " : isError ? "✗ " : "✓ "}${name} ${argSummary(name, args)}`.slice(0, 300);
-  return h("details", { class: `msg tool${isError ? " err" : ""}` }, h("summary", {}, summary),
+  return collapsible(`tool:${key}`, `msg tool${isError ? " err" : ""}`, summary, running,
     args && name !== "bash" ? h("pre", {}, JSON.stringify(args, null, 2)) : null,
     output !== null ? h("pre", {}, output || "(no output)") : null);
 }
@@ -491,19 +507,18 @@ function renderTranscript() {
   for (const entry of entries) {
     const message = entry.model && entry.model[0];
     if (entry.kind === "pi.user" && message) nodes.push(h("div", { class: "msg user" }, textOf(message.content)));
-    else if (entry.kind === "pi.assistant" && message) nodes.push(...renderAssistant(message, results, t.tools, shown));
-    else if (entry.kind === "pi.compaction") nodes.push(h("details", { class: "msg thinking" }, h("summary", {}, "context compacted"), h("pre", {}, textOf(message && message.content) || JSON.stringify(entry.data || {}, null, 2))));
+    else if (entry.kind === "pi.assistant" && message) nodes.push(...renderAssistant(message, results, t.tools, shown, entry.id, false));
+    else if (entry.kind === "pi.compaction") nodes.push(collapsible(`compaction:${entry.id}`, "msg thinking", "context compacted", false, h("pre", {}, textOf(message && message.content) || JSON.stringify(entry.data || {}, null, 2))));
     else if (entry.kind === "pi.reset") nodes.push(h("div", { class: "msg notice" }, "— context reset —"));
   }
-  if (t.message) nodes.push(...renderAssistant(t.message, results, t.tools, shown));
-  for (const [callId, tool] of t.tools) if (!shown.has(callId)) nodes.push(renderTool(tool.name, tool.args, tool.output, false, true));
+  if (t.message) nodes.push(...renderAssistant(t.message, results, t.tools, shown, "live", true));
+  for (const [callId, tool] of t.tools) if (!shown.has(callId)) nodes.push(renderTool(tool.name, tool.args, tool.output, false, true, callId));
   const session = currentSession();
   if (t.notice) nodes.push(h("div", { class: "msg notice" }, t.notice));
   if (session && session.pendingInputs) nodes.push(h("div", { class: "msg notice" }, `${session.pendingInputs} message(s) waiting for the VM`));
   if (session && session.busy && !t.message && !t.tools.size && !state.instance?.agentConnected) nodes.push(h("div", { class: "msg notice" }, "Interrupted work resumes when the VM is back."));
   if (!nodes.length) nodes.push(h("div", { class: "empty" }, "No messages yet."));
   box.replaceChildren(...nodes);
-  for (const el of box.querySelectorAll("details.tool")) if (el.querySelector("summary").textContent.startsWith("⏳")) el.open = true;
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
@@ -540,7 +555,7 @@ function settingsFromForm() {
     minCpu: Number(data.minCpu), minMemoryGb: Number(data.minMemoryGb),
     maxHourlyPrice: data.maxHourlyPrice === "" ? null : Number(data.maxHourlyPrice),
     category: data.category, zones: data.zones.split(",").map((z) => z.trim()).filter(Boolean),
-    idleMinutes: Number(data.idleMinutes), defaultModel: data.defaultModel,
+    idleMinutes: Number(data.idleMinutes), defaultModel: data.defaultModel, defaultThinkingLevel: data.defaultThinkingLevel,
     bandwidthMbps: Number(data.bandwidthMbps), dataDiskGb: Number(data.dataDiskGb),
     archiveAfterMinutes: data.archiveAfterMinutes === "" ? null : Number(data.archiveAfterMinutes),
   };
@@ -571,6 +586,16 @@ function modelKey(model) { return `${model.provider}/${model.modelId ?? model.id
 function renderModelOptions() {
   const models = state.auth?.models || [];
   $("#modelOptions").replaceChildren(...models.map((m) => h("option", { value: modelKey(m) }, m.name)));
+}
+
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+function thinkingSwitcher(session) {
+  const select = h("select", { title: "Thinking level for the next request (clamped to what the model supports)" },
+    ...THINKING_LEVELS.map((level) => h("option", { value: level }, `thinking: ${level}`)));
+  select.value = session.thinkingLevel || "off";
+  select.addEventListener("change", () => api(`/sessions/${session.id}/model`, { method: "POST", body: JSON.stringify({ thinkingLevel: select.value }) }).catch((e) => showError(e.message)));
+  return select;
 }
 
 function modelSwitcher(session) {

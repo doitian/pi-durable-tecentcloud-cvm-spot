@@ -5,7 +5,7 @@ import type { CredentialStore, OAuthAuth } from "@earendil-works/pi-ai";
 import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
 import type { MutableModels } from "@earendil-works/pi-ai/models";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { fauxAssistantMessage, fauxProvider, fauxText, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { type HubToAgent, PROTOCOL_VERSION } from "../../shared/protocol.ts";
 import { AGENT_VERSION, loadConfig } from "./config.ts";
 import { deviceId, FileCredentialStore } from "./credentials.ts";
@@ -77,7 +77,12 @@ function createModels(store: CredentialStore): MutableModels {
 		const faux = fauxProvider({ tokensPerSecond: 50 });
 		const step = (ctx: { messages: Array<{ role: string; content?: unknown }> }) => {
 			const last = ctx.messages.filter((m) => m.role !== "system").at(-1);
-			if (last?.role !== "user") return fauxAssistantMessage("Done. The command ran on the agent machine.");
+			if (last?.role !== "user") {
+				return fauxAssistantMessage([
+					fauxThinking("The command finished. Its output shows the host name and the first lines of the listing, so the work is complete and I can report back."),
+					fauxText("Done. The command ran on the agent machine."),
+				]);
+			}
 			const text = typeof last.content === "string" ? last.content : JSON.stringify(last.content ?? "");
 			const call = text.includes("delegate:")
 				? fauxToolCall("subagent", { task: "child task: run the command" })
