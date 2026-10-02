@@ -9,6 +9,7 @@ import {
 	createRegistry,
 	Harness,
 	type HarnessSettings,
+	type Registry,
 	type SnapshotEvent,
 	watchEvents,
 } from "@earendil-works/pi-durable";
@@ -17,9 +18,10 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import type { PendingInput, SessionReport, SessionSpec } from "../../shared/protocol.ts";
 import type { AgentConfig } from "./config.ts";
-import { SpotAgent } from "./extension.ts";
 import { prepareWorkspace } from "./git.ts";
 import { withSessionId } from "./models.ts";
+import { createPiPrompt } from "./pi-prompt.ts";
+import { Subagent } from "./subagent.ts";
 
 const ENTRY_CHUNK_BYTES = 600_000;
 
@@ -30,9 +32,13 @@ export interface SessionSink {
 	log(level: "info" | "warn" | "error", message: string): void;
 }
 
-const registry = createRegistry();
-registry.install(CodingTools);
-registry.install(SpotAgent);
+function createCodingRegistry(config: AgentConfig): Registry {
+	const registry = createRegistry();
+	registry.install(CodingTools);
+	registry.install(Subagent);
+	registry.install(createPiPrompt(config.agentDir, config.workDir));
+	return registry;
+}
 
 const settings: HarnessSettings = {
 	retry: { maxRetries: 6 },
@@ -68,6 +74,7 @@ class Session {
 		public spec: SessionSpec,
 		private readonly config: AgentConfig,
 		private readonly models: MutableModels,
+		private readonly registry: Registry,
 		private readonly sink: SessionSink,
 		private readonly context: Context,
 	) {}
@@ -116,7 +123,7 @@ class Session {
 			await openNodeSqliteStorage(join(dir, "session.sqlite")),
 			{
 				models: withSessionId(this.models, this.spec.id),
-				registry,
+				registry: this.registry,
 				settings,
 				env: (target) => new NodeExecutionEnv({ cwd: target.cwd ?? cwd, shellEnv: process.env }),
 				onReport: (error) => this.sink.log("warn", `session ${this.spec.id}: ${String(error)}`),
@@ -265,6 +272,18 @@ class Session {
 		await this.root?.abort(this.context);
 	}
 
+	/** Summarizes older context now; it is placed when the conversation is idle or at the next turn boundary. */
+	async compact(instructions?: string): Promise<void> {
+		if (!this.root) throw new Error("session is not open");
+		await this.root.compact(instructions || undefined, this.context);
+	}
+
+	/** Starts a fresh context, optionally from a handoff note; older entries stay in storage. */
+	async reset(handoff?: string): Promise<void> {
+		if (!this.root) throw new Error("session is not open");
+		await this.root.reset(handoff || undefined, this.context);
+	}
+
 	async close(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
@@ -277,13 +296,16 @@ class Session {
 
 export class SessionManager {
 	private readonly sessions = new Map<string, Session>();
+	private readonly registry: Registry;
 
 	constructor(
 		private readonly config: AgentConfig,
 		private readonly models: MutableModels,
 		private readonly sink: SessionSink,
 		private readonly context: Context,
-	) {}
+	) {
+		this.registry = createCodingRegistry(config);
+	}
 
 	get all(): Session[] {
 		return [...this.sessions.values()];
@@ -300,7 +322,7 @@ export class SessionManager {
 	upsert(spec: SessionSpec, resync = false): void {
 		const existing = this.sessions.get(spec.id);
 		if (!existing) {
-			const session = new Session(spec, this.config, this.models, this.sink, this.context);
+			const session = new Session(spec, this.config, this.models, this.registry, this.sink, this.context);
 			this.sessions.set(spec.id, session);
 			void session.open();
 			return;
@@ -319,6 +341,14 @@ export class SessionManager {
 
 	async abort(sessionId: string): Promise<void> {
 		await this.sessions.get(sessionId)?.abort();
+	}
+
+	async compact(sessionId: string, instructions?: string): Promise<void> {
+		await this.sessions.get(sessionId)?.compact(instructions);
+	}
+
+	async reset(sessionId: string, handoff?: string): Promise<void> {
+		await this.sessions.get(sessionId)?.reset(handoff);
 	}
 
 	async resync(sessionId: string): Promise<void> {

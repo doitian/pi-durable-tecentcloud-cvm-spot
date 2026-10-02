@@ -158,9 +158,14 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
       <label>Stop after idle (minutes)<input name="idleMinutes" type="number" min="1" step="1"></label>
       <label>Default model<input name="defaultModel" list="modelOptions"></label>
       <label>Public bandwidth (Mbps)<input name="bandwidthMbps" type="number" min="1" step="1"></label>
-      <label class="wide">Data disk size for a new disk (GB)<input name="dataDiskGb" type="number" min="20" step="10"></label>
+      <label>Data disk size for a new disk (GB)<input name="dataDiskGb" type="number" min="20" step="10"></label>
+      <label>Snapshot and delete the idle disk after (minutes)<input name="archiveAfterMinutes" type="number" min="0" step="5" placeholder="never"></label>
     </div>
     <div id="candidates"></div>
+    <div class="row" style="margin-top: 12px">
+      <div class="msg notice">Replacing the data disk deletes it and its snapshots: session state, workspaces and saved logins. Sessions are archived. The next start creates an empty disk at the size above.</div>
+      <button type="button" class="danger" id="replaceDiskBtn">Replace data disk</button>
+    </div>
     <div class="actions">
       <button type="button" id="previewBtn">Preview matching instances</button>
       <span class="spacer"></span>
@@ -352,8 +357,9 @@ function renderState() {
     pill.append(h("span", { class: `dot ${cls}` }), h("span", {}, `${inst.type}${spec} · ${inst.zone}${price} · ${label}${inst.reclaimAt ? " · reclaim pending" : ""}`));
   }
   const disk = $("#diskPill");
-  disk.hidden = !state.disk;
+  disk.hidden = !state.disk && !state.archive;
   if (state.disk) disk.textContent = `disk ${state.disk.id} · ${state.disk.sizeGb} GB · ${state.disk.zone}`;
+  else if (state.archive) disk.textContent = `disk saved as snapshot ${state.archive.snapshotId} · ${state.archive.sizeGb} GB · restored on next start`;
   showError(state.lastError && Date.now() - state.lastError.at < 30 * 60_000 ? `${state.lastError.message} (${fmtTime(state.lastError.at)})` : "");
 
   const list = $("#sessions");
@@ -412,6 +418,14 @@ function renderHead() {
     h("span", { class: "meta" }, session.repoUrl ? `${session.repoUrl} · ` : "", label, session.costUsd ? ` · $${session.costUsd.toFixed(2)}` : ""),
     session.error ? h("span", { class: "meta", style: "color: var(--err)" }, session.error) : "",
     h("span", { class: "spacer" }),
+    h("button", { title: "Summarize older context now", onclick: () => {
+      const instructions = prompt("Compact the context now. Optional: what the summary must keep.", "");
+      if (instructions !== null) api(`/sessions/${session.id}/compact`, { method: "POST", body: JSON.stringify({ instructions }) }).catch((e) => showError(e.message));
+    } }, "Compact"),
+    h("button", { title: "Start a fresh context; the history stays stored", onclick: () => {
+      const handoff = prompt("Start a fresh context. Optional: a handoff note the agent starts from.", "");
+      if (handoff !== null) api(`/sessions/${session.id}/reset`, { method: "POST", body: JSON.stringify({ handoff }) }).catch((e) => showError(e.message));
+    } }, "New context"),
     h("button", { class: "danger", onclick: () => api(`/sessions/${session.id}/abort`, { method: "POST" }).catch((e) => showError(e.message)) }, "Abort"),
     h("button", { onclick: () => { if (confirm("Archive this session? Its files stay on the data disk.")) api(`/sessions/${session.id}/archive`, { method: "POST" }).then(() => select(null)); } }, "Archive"),
   );
@@ -528,6 +542,7 @@ function settingsFromForm() {
     category: data.category, zones: data.zones.split(",").map((z) => z.trim()).filter(Boolean),
     idleMinutes: Number(data.idleMinutes), defaultModel: data.defaultModel,
     bandwidthMbps: Number(data.bandwidthMbps), dataDiskGb: Number(data.dataDiskGb),
+    archiveAfterMinutes: data.archiveAfterMinutes === "" ? null : Number(data.archiveAfterMinutes),
   };
 }
 
@@ -700,6 +715,14 @@ function renderLogins() {
 
 $("#loginsBtn").addEventListener("click", () => { renderLogins(); $("#loginsDialog").showModal(); });
 $("#loginsClose").addEventListener("click", () => $("#loginsDialog").close());
+
+$("#replaceDiskBtn").addEventListener("click", async () => {
+  if (!confirm("Delete the data disk and its snapshots? Session state, workspaces and saved logins are lost, and all sessions are archived.")) return;
+  try {
+    await api("/disk/replace", { method: "POST" });
+    $("#settingsDialog").close();
+  } catch (error) { showError(error.message); }
+});
 
 $("#startBtn").addEventListener("click", () => api("/instance/start", { method: "POST" }).catch((e) => showError(e.message)));
 $("#stopBtn").addEventListener("click", () => { if (confirm("Stop the VM now? Running work is checkpointed and resumes on the next VM.")) api("/instance/stop", { method: "POST" }).catch((e) => showError(e.message)); });

@@ -20,6 +20,7 @@ import {
 	type Category,
 	createDisk,
 	createSnapshot,
+	deleteSnapshots,
 	describeDisk,
 	describeTaggedInstances,
 	detachDisk,
@@ -33,6 +34,7 @@ import {
 	listSpotCandidates,
 	runSpotInstance,
 	snapshotState,
+	terminateDisk,
 	terminateInstance,
 } from "./cloud.ts";
 import type { Env } from "./env.ts";
@@ -57,6 +59,8 @@ export interface Settings {
 	zones: string[];
 	idleMinutes: number;
 	dataDiskGb: number;
+	/** Idle minutes before the data disk is snapshotted and deleted; null keeps it. */
+	archiveAfterMinutes: number | null;
 	bandwidthMbps: number;
 	defaultModel: string;
 }
@@ -100,6 +104,13 @@ interface CloudState {
 	cooldown: Record<string, number>;
 	noCapacitySince?: number;
 	migration?: { fromDiskId: string; toZone: string; snapshotId?: string; newDiskId?: string; startedAt: number };
+	/** Latest complete snapshot of the data disk; the disk is restored from it when no disk exists. */
+	archive?: { snapshotId: string; sizeGb: number; at: number };
+	/** Snapshot being taken of an idle disk. */
+	archiving?: { snapshotId: string; startedAt: number };
+	staleSnapshots?: string[];
+	/** Since when the disk has had no instance and no work. */
+	diskIdleSince?: number;
 	orphans: Array<{ kind: "disk" | "snapshot"; id: string; note: string }>;
 	lastError?: { message: string; at: number };
 	idleSince?: number;
@@ -230,7 +241,8 @@ export class Hub extends DurableObject<Env> {
 				.map((zone) => zone.trim())
 				.filter(Boolean),
 			idleMinutes: envNumber(env.IDLE_MINUTES, 20),
-			dataDiskGb: envNumber(env.DATA_DISK_GB, 100),
+			dataDiskGb: envNumber(env.DATA_DISK_GB, 30),
+			archiveAfterMinutes: env.ARCHIVE_AFTER_MINUTES === "" ? null : envNumber(env.ARCHIVE_AFTER_MINUTES, 30),
 			bandwidthMbps: envNumber(env.BANDWIDTH_MBPS, 100),
 			defaultModel: env.DEFAULT_MODEL || "anthropic/claude-sonnet-5",
 		};
@@ -339,6 +351,10 @@ export class Hub extends DurableObject<Env> {
 		if (patch.zones !== undefined) next.zones = patch.zones.map((zone) => zone.trim()).filter(Boolean);
 		if (patch.idleMinutes !== undefined) next.idleMinutes = Math.max(1, Number(patch.idleMinutes));
 		if (patch.dataDiskGb !== undefined) next.dataDiskGb = Math.max(20, Number(patch.dataDiskGb));
+		if (patch.archiveAfterMinutes !== undefined) {
+			next.archiveAfterMinutes =
+				patch.archiveAfterMinutes === null || String(patch.archiveAfterMinutes) === "" ? null : Math.max(0, Number(patch.archiveAfterMinutes));
+		}
 		if (patch.bandwidthMbps !== undefined) next.bandwidthMbps = Math.max(1, Number(patch.bandwidthMbps));
 		if (patch.defaultModel !== undefined) {
 			parseModel(patch.defaultModel);
@@ -425,6 +441,21 @@ export class Hub extends DurableObject<Env> {
 		this.log("info", `session "${spec.title}" now uses ${model}`);
 	}
 
+	/** Summarizes the session's older context now instead of waiting for automatic compaction. */
+	async compactSession(sessionId: string, instructions?: string): Promise<void> {
+		if (!this.sendToAgent({ t: "compact", sessionId, ...(instructions?.trim() ? { instructions: instructions.trim() } : {}) })) {
+			throw new Error("No VM is online. Start it first.");
+		}
+	}
+
+	/** Starts a fresh context for the session, optionally from a handoff note; its history stays stored. */
+	async resetSession(sessionId: string, handoff?: string): Promise<void> {
+		if (!this.sendToAgent({ t: "reset", sessionId, ...(handoff?.trim() ? { handoff: handoff.trim() } : {}) })) {
+			throw new Error("No VM is online. Start it first.");
+		}
+		this.log("info", `new context requested for session ${sessionId}`);
+	}
+
 	async abortSession(sessionId: string): Promise<void> {
 		this.sql.exec("DELETE FROM inputs WHERE session_id = ? AND acked_at IS NULL", sessionId);
 		if (this.sendToAgent({ t: "abort", sessionId })) {
@@ -455,6 +486,37 @@ export class Hub extends DurableObject<Env> {
 			.toArray()
 			.reverse()
 			.map((row) => JSON.parse(row.data));
+	}
+
+	/**
+	 * Deletes the data disk and its snapshots so the next start creates a fresh one at the current size. Everything on
+	 * the disk goes: session state, workspaces and saved logins. Sessions are archived because they cannot continue.
+	 */
+	async replaceDataDisk(): Promise<void> {
+		const cloud = this.loadCloud();
+		if (cloud.instance || cloud.retired.length > 0) throw new Error("Stop the VM and wait until it is gone first.");
+		const tc = this.tencent();
+		if (cloud.disk) {
+			const disk = await describeDisk(tc, cloud.disk.id);
+			if (disk?.instanceId) throw new Error(`The data disk is still attached to ${disk.instanceId}.`);
+			if (disk) await terminateDisk(tc, cloud.disk.id);
+		}
+		const snapshots = [cloud.archive?.snapshotId, cloud.archiving?.snapshotId, ...(cloud.staleSnapshots ?? [])].filter(
+			(id): id is string => id !== undefined,
+		);
+		await deleteSnapshots(tc, snapshots);
+		this.updateCloud((current) => {
+			current.disk = undefined;
+			current.archive = undefined;
+			current.archiving = undefined;
+			current.staleSnapshots = [];
+			current.diskIdleSince = undefined;
+			current.migration = undefined;
+		});
+		this.sql.exec("UPDATE sessions SET archived = 1 WHERE archived = 0");
+		this.sql.exec("DELETE FROM inputs WHERE acked_at IS NULL");
+		this.sql.exec("DELETE FROM kv WHERE key = 'auth'");
+		this.log("warn", `data disk ${cloud.disk?.id ?? "(none)"} and ${snapshots.length} snapshot(s) deleted; sessions archived`);
 	}
 
 	/** Keeps a VM up for one idle period even without work, for example to warm it up. */
@@ -835,6 +897,7 @@ export class Hub extends DurableObject<Env> {
 			...(auth ? { auth } : {}),
 			sessions,
 			...(cloud.disk ? { disk: { id: cloud.disk.id, zone: cloud.disk.zone, sizeGb: cloud.disk.sizeGb } } : {}),
+			...(cloud.archive && !cloud.disk ? { archive: { snapshotId: cloud.archive.snapshotId, sizeGb: cloud.archive.sizeGb, at: cloud.archive.at } } : {}),
 			...(cloud.lastError ? { lastError: cloud.lastError } : {}),
 			log,
 		};
@@ -884,11 +947,20 @@ export class Hub extends DurableObject<Env> {
 		const cloud = this.loadCloud();
 		const demand = this.hasDemand(now, cloud);
 		if (this.localMode) return;
-		if (!cloud.instance && cloud.retired.length === 0 && !cloud.migration && !demand) {
-			await this.ctx.storage.deleteAlarm();
-			return;
-		}
 		const settings = this.settings();
+		if (!cloud.instance && cloud.retired.length === 0 && !cloud.migration && !demand) {
+			const pendingDiskWork = cloud.archiving !== undefined || (cloud.staleSnapshots?.length ?? 0) > 0;
+			const archiveAt =
+				cloud.disk && settings.archiveAfterMinutes !== null && cloud.diskIdleSince !== undefined
+					? cloud.diskIdleSince + settings.archiveAfterMinutes * 60_000
+					: undefined;
+			const archiveDue = cloud.disk !== undefined && settings.archiveAfterMinutes !== null && (archiveAt === undefined || archiveAt <= now);
+			if (!pendingDiskWork && !archiveDue) {
+				if (archiveAt !== undefined) await this.ctx.storage.setAlarm(archiveAt);
+				else await this.ctx.storage.deleteAlarm();
+				return;
+			}
+		}
 		this.concurrentCloudChanges = [];
 		try {
 			const tc = this.tencent();
@@ -898,6 +970,7 @@ export class Hub extends DurableObject<Env> {
 			this.adoptStrays(cloud, instances, disk, now);
 			if (cloud.instance) await this.advanceInstance(tc, cloud, cloud.instance, instances, disk, demand, settings, now);
 			await this.processRetired(tc, cloud, instances, disk, now);
+			await this.manageDiskArchive(tc, cloud, disk, demand, settings, now);
 			if (!cloud.instance && demand) await this.launch(tc, cloud, settings, disk, now);
 		} catch (error) {
 			cloud.lastError = { message: errorMessage(error), at: now };
@@ -911,12 +984,15 @@ export class Hub extends DurableObject<Env> {
 
 		const transitioning =
 			cloud.migration !== undefined ||
+			cloud.archiving !== undefined ||
 			cloud.retired.length > 0 ||
 			(cloud.instance !== undefined && (cloud.instance.phase !== "running" || !this.agentSocket(cloud.instance.id)));
 		if (transitioning) await this.ctx.storage.setAlarm(now + 10_000);
 		else if (!cloud.instance && demand) await this.ctx.storage.setAlarm(now + (cloud.noCapacitySince ? 60_000 : 15_000));
 		else if (cloud.instance) await this.ctx.storage.setAlarm(now + 30_000);
-		else await this.ctx.storage.deleteAlarm();
+		else if (cloud.disk && cloud.diskIdleSince !== undefined && settings.archiveAfterMinutes !== null) {
+			await this.ctx.storage.setAlarm(Math.max(now + 10_000, cloud.diskIdleSince + settings.archiveAfterMinutes * 60_000));
+		} else await this.ctx.storage.deleteAlarm();
 	}
 
 	/** Tagged instances the Hub does not track (or that hold the data disk) are retired and terminated. */
@@ -1071,6 +1147,57 @@ export class Hub extends DurableObject<Env> {
 		}
 	}
 
+	/**
+	 * Snapshots the data disk once it has been idle for `archiveAfterMinutes`, then deletes it; `launch` restores it.
+	 * The previous snapshot is deleted only after a newer one is complete.
+	 */
+	private async manageDiskArchive(
+		tc: TencentCloud,
+		cloud: CloudState,
+		disk: DiskInfo | undefined,
+		demand: boolean,
+		settings: Settings,
+		now: number,
+	): Promise<void> {
+		if (cloud.staleSnapshots?.length) {
+			await deleteSnapshots(tc, cloud.staleSnapshots);
+			this.log("info", `deleted old snapshot(s) ${cloud.staleSnapshots.join(", ")}`);
+			cloud.staleSnapshots = [];
+		}
+		const idle = !demand && !cloud.instance && cloud.retired.length === 0 && !cloud.migration;
+		if (cloud.archiving) {
+			const state = await snapshotState(tc, cloud.archiving.snapshotId);
+			if (state === "NORMAL") {
+				const previous = cloud.archive?.snapshotId;
+				cloud.archive = { snapshotId: cloud.archiving.snapshotId, sizeGb: cloud.disk?.sizeGb ?? 0, at: now };
+				cloud.archiving = undefined;
+				if (previous && previous !== cloud.archive.snapshotId) (cloud.staleSnapshots ??= []).push(previous);
+				if (idle && cloud.disk && disk && !disk.instanceId && disk.state === "UNATTACHED") {
+					await terminateDisk(tc, cloud.disk.id);
+					this.log("info", `data disk ${cloud.disk.id} saved as snapshot ${cloud.archive.snapshotId} and deleted`);
+					cloud.disk = undefined;
+					cloud.diskIdleSince = undefined;
+				} else {
+					this.log("info", `snapshot ${cloud.archive.snapshotId} complete; keeping the disk because work arrived`);
+				}
+			} else if (state === undefined || /FAIL/i.test(state)) {
+				this.log("error", `snapshot ${cloud.archiving.snapshotId} failed (${state ?? "missing"}); keeping the disk`);
+				cloud.archiving = undefined;
+			}
+			return;
+		}
+		if (!idle || !cloud.disk || !disk || disk.instanceId || disk.state !== "UNATTACHED") {
+			if (!idle) cloud.diskIdleSince = undefined;
+			return;
+		}
+		if (settings.archiveAfterMinutes === null) return;
+		cloud.diskIdleSince ??= now;
+		if (now - cloud.diskIdleSince < settings.archiveAfterMinutes * 60_000) return;
+		const snapshotId = await createSnapshot(tc, cloud.disk.id, `${this.namePrefix}-idle-${new Date(now).toISOString().slice(0, 16)}`);
+		cloud.archiving = { snapshotId, startedAt: now };
+		this.log("info", `data disk idle for ${settings.archiveAfterMinutes} min; snapshotting it as ${snapshotId}`);
+	}
+
 	private async launch(
 		tc: TencentCloud,
 		cloud: CloudState,
@@ -1081,18 +1208,28 @@ export class Hub extends DurableObject<Env> {
 		const excluded = (zone: string, type: string) => (cloud.cooldown[`${zone}/${type}`] ?? 0) > now;
 		if (cloud.migration) return this.advanceMigration(tc, cloud, disk, now);
 		if (!cloud.disk) {
+			// A new or restored disk can go to whichever zone has the best matching capacity right now.
 			const anywhere = await listSpotCandidates(tc, settings, settings.zones, excluded);
 			if (!anywhere[0]) throw new Error("No spot instance type in the region matches the settings");
 			const zone = anywhere[0].zone;
+			const archive = cloud.archive;
+			const sizeGb = Math.max(settings.dataDiskGb, archive?.sizeGb ?? 0);
 			const id = await createDisk(tc, {
 				zone,
-				sizeGb: settings.dataDiskGb,
+				sizeGb,
 				diskType: this.env.DATA_DISK_TYPE || "CLOUD_BSSD",
 				name: `${this.namePrefix}-data`,
 				tag: { key: TAG_KEY, value: this.namePrefix },
+				...(archive ? { snapshotId: archive.snapshotId } : {}),
 			});
-			cloud.disk = { id, zone, sizeGb: settings.dataDiskGb, formatted: false };
-			this.log("info", `created data disk ${id} (${settings.dataDiskGb} GB) in ${zone}`);
+			cloud.disk = { id, zone, sizeGb, formatted: archive !== undefined };
+			cloud.diskIdleSince = undefined;
+			this.log(
+				"info",
+				archive
+					? `restoring data disk ${id} (${sizeGb} GB) in ${zone} from snapshot ${archive.snapshotId}`
+					: `created data disk ${id} (${sizeGb} GB) in ${zone}`,
+			);
 		}
 		const zone = cloud.disk.zone;
 		const candidates = await listSpotCandidates(tc, settings, [zone], excluded);

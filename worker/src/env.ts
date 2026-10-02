@@ -29,6 +29,8 @@ export interface Env {
 	ZONES?: string;
 	IDLE_MINUTES?: string;
 	DATA_DISK_GB?: string;
+	/** Idle minutes before the data disk is snapshotted and deleted; empty keeps it. */
+	ARCHIVE_AFTER_MINUTES?: string;
 	DATA_DISK_TYPE?: string;
 	SYSTEM_DISK_TYPE?: string;
 	SYSTEM_DISK_GB?: string;

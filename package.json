@@ -9,7 +9,7 @@
   "scripts": {
     "build": "npm run build -w agent",
     "typecheck": "npm run typecheck -w agent && npm run typecheck -w worker",
-    "test": "npm test -w worker",
+    "test": "npm test -w agent && npm test -w worker",
     "test:e2e": "node sim/e2e.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"

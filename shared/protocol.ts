@@ -106,6 +106,8 @@ export type HubToAgent =
 	| { t: "abort"; sessionId: string }
 	/** Restart one session's event stream so a newly attached browser gets a full snapshot. */
 	| { t: "resync"; sessionId: string }
+	| { t: "compact"; sessionId: string; instructions?: string }
+	| { t: "reset"; sessionId: string; handoff?: string }
 	| { t: "shutdown"; reason: string }
 	| { t: "login"; loginId: string; provider: string; type: "oauth" | "api_key" }
 	| { t: "login_reply"; loginId: string; promptId: string; value: string }
@@ -147,6 +149,8 @@ export interface PanelState {
 	instance?: InstanceView;
 	sessions: SessionView[];
 	disk?: { id: string; zone: string; sizeGb: number };
+	/** Set while the data disk exists only as a snapshot. */
+	archive?: { snapshotId: string; sizeGb: number; at: number };
 	lastError?: { message: string; at: number };
 	log: Array<{ at: number; level: string; message: string }>;
 	/** Last provider list reported by an agent. */

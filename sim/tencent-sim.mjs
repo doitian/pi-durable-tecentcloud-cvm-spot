@@ -216,6 +216,23 @@ const handlers = {
 		for (const id of params.DiskIds) disks.get(id).deleteWithInstance = params.DeleteWithInstance;
 		return {};
 	},
+	TerminateDisks(params) {
+		for (const id of params.DiskIds) {
+			const disk = disks.get(id);
+			if (!disk) fail("InvalidDisk.NotFound", id);
+			if (disk.state !== "UNATTACHED") fail("ResourceBusy", `disk is ${disk.state}`);
+			disks.delete(id);
+			log(`TerminateDisks ${id}`);
+		}
+		return {};
+	},
+	DeleteSnapshots(params) {
+		for (const id of params.SnapshotIds) {
+			snapshots.delete(id);
+			log(`DeleteSnapshots ${id}`);
+		}
+		return {};
+	},
 	CreateSnapshot(params) {
 		const id = newId("snap");
 		snapshots.set(id, { id, state: "CREATING", diskId: params.DiskId });

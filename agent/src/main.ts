@@ -72,15 +72,18 @@ const fauxOAuth: OAuthAuth = {
 function createModels(store: CredentialStore): MutableModels {
 	const models = builtinModels({ credentials: store });
 	if (process.env.PI_FAUX === "1") {
-		// A scripted model for local testing: one bash call per prompt, then a short answer.
+		// A scripted model for local testing: one tool call per prompt (a subagent when asked to "delegate:", bash
+		// otherwise), then a short answer.
 		const faux = fauxProvider({ tokensPerSecond: 50 });
-		const step = (ctx: { messages: Array<{ role: string }> }) =>
-			ctx.messages.filter((m) => m.role !== "system").at(-1)?.role === "user"
-				? fauxAssistantMessage(
-						fauxToolCall("bash", { command: "sleep 8; echo hello from $(hostname); ls -la | head -5" }),
-						{ stopReason: "toolUse" },
-					)
-				: fauxAssistantMessage("Done. The command ran on the agent machine.");
+		const step = (ctx: { messages: Array<{ role: string; content?: unknown }> }) => {
+			const last = ctx.messages.filter((m) => m.role !== "system").at(-1);
+			if (last?.role !== "user") return fauxAssistantMessage("Done. The command ran on the agent machine.");
+			const text = typeof last.content === "string" ? last.content : JSON.stringify(last.content ?? "");
+			const call = text.includes("delegate:")
+				? fauxToolCall("subagent", { task: "child task: run the command" })
+				: fauxToolCall("bash", { command: "sleep 8; echo hello from $(hostname); ls -la | head -5" });
+			return fauxAssistantMessage(call, { stopReason: "toolUse" });
+		};
 		faux.setResponses(Array.from({ length: 10_000 }, () => step));
 		models.setProvider({ ...faux.provider, auth: { ...faux.provider.auth, oauth: fauxOAuth } });
 	}
@@ -133,6 +136,14 @@ async function handle(message: HubToAgent): Promise<void> {
 			return;
 		case "resync":
 			await manager?.resync(message.sessionId);
+			return;
+		case "compact":
+			await manager?.compact(message.sessionId, message.instructions);
+			log("info", `compaction requested for session ${message.sessionId}`);
+			return;
+		case "reset":
+			await manager?.reset(message.sessionId, message.handoff);
+			log("info", `new context started for session ${message.sessionId}`);
 			return;
 		case "shutdown":
 			await stop(`shutdown: ${message.reason}`, false);

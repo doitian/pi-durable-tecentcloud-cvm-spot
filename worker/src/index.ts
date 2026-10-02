@@ -47,6 +47,7 @@ async function api(request: Request, url: URL, env: Env): Promise<Response> {
 	if (method === "POST" && path === "/instance/start") return json(await stub.startInstance());
 	if (method === "POST" && path === "/instance/stop") return json(await stub.stopInstance());
 	if (method === "POST" && path === "/reconcile") return json(await stub.tick());
+	if (method === "POST" && path === "/disk/replace") return json(await stub.replaceDataDisk());
 	if (session) {
 		const [, id, action] = session as unknown as [string, string, string | undefined];
 		if (method === "GET" && action === "/transcript") return json(await stub.transcript(id));
@@ -55,6 +56,12 @@ async function api(request: Request, url: URL, env: Env): Promise<Response> {
 			return json(await stub.sendInput(id, input.content, input.steer ? "steer" : "followUp"));
 		}
 		if (method === "POST" && action === "/abort") return json(await stub.abortSession(id));
+		if (method === "POST" && action === "/compact") {
+			return json(await stub.compactSession(id, (await body<{ instructions?: string }>()).instructions));
+		}
+		if (method === "POST" && action === "/reset") {
+			return json(await stub.resetSession(id, (await body<{ handoff?: string }>()).handoff));
+		}
 		if (method === "POST" && action === "/model") {
 			return json(await stub.setSessionModel(id, (await body<{ model: string }>()).model));
 		}

@@ -3,7 +3,7 @@
 //
 //   npm run test:e2e
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -72,7 +72,21 @@ const interrupted = async (id) =>
 const input = (id, content) => api(`/sessions/${id}/input`, { method: "POST", body: JSON.stringify({ content }) });
 const step = (message) => console.log(`\n== ${message}`);
 
+const CONTEXT_MARKER = "E2E-GLOBAL-CONTEXT-MARKER";
+
+/** What pi would find in ~/.pi/agent on the data disk: a global AGENTS.md and one skill. */
+function seedAgentDir() {
+	const agentDir = join(scratch, "data", "home", ".pi", "agent");
+	mkdirSync(join(agentDir, "skills", "e2e-skill"), { recursive: true });
+	writeFileSync(join(agentDir, "AGENTS.md"), `Always mention ${CONTEXT_MARKER}.\n`);
+	writeFileSync(
+		join(agentDir, "skills", "e2e-skill", "SKILL.md"),
+		"---\nname: e2e-skill\ndescription: Checks that skills reach the prompt.\n---\nDo the thing.\n",
+	);
+}
+
 async function main() {
+	seedAgentDir();
 	start("sim", process.execPath, [join(root, "sim/tencent-sim.mjs")], {
 		env: { ...process.env, SIM_HUB_URL: HUB, SIM_DATA_DIR: join(scratch, "data"), SIM_LATENCY_MS: "400" },
 	});
@@ -84,6 +98,7 @@ async function main() {
 		ADMIN_TOKEN: TOKEN,
 		DEFAULT_MODEL: "faux/faux-1",
 		IDLE_MINUTES: "1",
+		ARCHIVE_AFTER_MINUTES: "0",
 		AGENT_ENV: "{}",
 	};
 	start(
@@ -101,6 +116,22 @@ async function main() {
 	await waitFor("first answer", async () => (await answers(created.id)) >= 1, 60_000);
 	console.log(`ok: ${first.id} (${first.type}) answered`);
 
+	step("the prompt carries pi's sections, context files and skills; subagents, compact and new context work");
+	const system = (await api(`/sessions/${created.id}/transcript`)).find((e) => e.kind === "pi.system")?.model?.[0];
+	const sections = system?.sections ?? {};
+	for (const [name, needle] of [["rules", "Use edit for precise changes"], ["project_context", CONTEXT_MARKER], ["skills", "e2e-skill"], ["tools", "subagent"]]) {
+		if (!sections[name]?.includes(needle)) throw new Error(`system prompt section ${name} lacks "${needle}"`);
+	}
+	await input(created.id, "delegate: list the files");
+	await waitFor("subagent answer", async () => (await api(`/sessions/${created.id}/transcript`)).some(
+		(e) => e.kind === "pi.tool-result" && e.model?.[0]?.toolName === "subagent" && JSON.stringify(e.model).includes("Done."),
+	), 90_000);
+	await waitFor("delegating run settled", async () => !(await session(created.id))?.busy, 30_000);
+	await api(`/sessions/${created.id}/compact`, { method: "POST", body: JSON.stringify({ instructions: "" }) });
+	await api(`/sessions/${created.id}/reset`, { method: "POST", body: JSON.stringify({ handoff: "Continue from here." }) });
+	await waitFor("reset entry", async () => (await api(`/sessions/${created.id}/transcript`)).some((e) => e.kind === "pi.reset"), 30_000);
+	console.log("ok: pi sections, AGENTS.md and skill present; subagent answered; compact accepted; new context started");
+
 	step("a spot reclaim mid-run moves the work to a replacement instance");
 	await input(created.id, "task A");
 	await input(created.id, "task B");
@@ -110,19 +141,21 @@ async function main() {
 		const agent = await runningAgent();
 		return agent && agent.id !== first.id ? agent : undefined;
 	}, 120_000);
-	await waitFor("both tasks answered", async () => (await answers(created.id)) >= 3, 90_000);
+	await waitFor("both tasks answered", async () => (await answers(created.id)) >= 4, 90_000);
 	console.log(`ok: replacement ${second.id} (${second.type}); interrupted tool seen: ${await interrupted(created.id)}`);
 
-	step("the instance is terminated after the idle period and the disk is kept");
-	await waitFor("idle shutdown", async () => {
+	step("the instance is terminated after the idle period, then the idle disk is saved as a snapshot and deleted");
+	await waitFor("idle shutdown", async () => (await simState()).instances.length === 0, 180_000);
+	await waitFor("disk archived", async () => {
 		const state = await simState();
-		return state.instances.length === 0 && state.disks.length === 1 && state.disks[0].state === "UNATTACHED";
-	}, 180_000);
-	console.log("ok: no instances left, data disk unattached");
+		return state.disks.length === 0 && state.snapshots.some((s) => s.state === "NORMAL");
+	}, 120_000);
+	console.log("ok: no instances, no disk, one snapshot");
 
-	step("an instance lost without notice is replaced and its run resumes");
+	step("work restores the disk from its snapshot; an instance lost without notice is replaced and its run resumes");
 	await input(created.id, "task C");
-	const third = await waitFor("agent for task C", runningAgent, 120_000);
+	const third = await waitFor("agent for task C", runningAgent, 150_000);
+	if ((await simState()).disks.length !== 1) throw new Error("the data disk was not restored");
 	await waitFor("task C running", async () => (await session(created.id))?.busy, 30_000);
 	await sleep(3000);
 	await fetch(`${SIM}/cvm`, {
@@ -134,7 +167,7 @@ async function main() {
 		const agent = await runningAgent();
 		return agent && agent.id !== third.id ? agent : undefined;
 	}, 150_000);
-	await waitFor("task C answered", async () => (await answers(created.id)) >= 4, 90_000);
+	await waitFor("task C answered", async () => (await answers(created.id)) >= 5, 90_000);
 	console.log(`ok: ${third.id} lost, ${fourth.id} finished the run`);
 
 	step("Stop VM terminates the instance promptly instead of waiting for the drain timeout");

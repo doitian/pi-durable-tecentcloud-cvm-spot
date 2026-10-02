@@ -37,10 +37,12 @@
     "ZONES": "",
     "IDLE_MINUTES": "20",
 
-    "DATA_DISK_GB": "100",
+    "DATA_DISK_GB": "30",
+    // Snapshot and delete the data disk after this many idle minutes; restored on the next start. Empty: keep it.
+    "ARCHIVE_AFTER_MINUTES": "30",
     "DATA_DISK_TYPE": "CLOUD_BSSD",
     "SYSTEM_DISK_TYPE": "CLOUD_BSSD",
-    "SYSTEM_DISK_GB": "50",
+    "SYSTEM_DISK_GB": "30",
     "BANDWIDTH_MBPS": "100",
     "NODE_MAJOR": "24",
     "AGENT_SUDO": "true",

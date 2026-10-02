@@ -258,6 +258,26 @@ export async function detachDisk(tc: TencentCloud, diskId: string, instanceId: s
 	await tc.cbs("DetachDisks", { DiskIds: [diskId], InstanceId: instanceId });
 }
 
+/** Deletes a data disk for good; the Hub only does this once a snapshot of it is complete, or when asked to. */
+export async function terminateDisk(tc: TencentCloud, diskId: string): Promise<void> {
+	try {
+		await tc.cbs("TerminateDisks", { DiskIds: [diskId] });
+	} catch (error) {
+		if (error instanceof TencentApiError && /NotFound/i.test(error.code)) return;
+		throw error;
+	}
+}
+
+export async function deleteSnapshots(tc: TencentCloud, snapshotIds: readonly string[]): Promise<void> {
+	if (snapshotIds.length === 0) return;
+	try {
+		await tc.cbs("DeleteSnapshots", { SnapshotIds: [...snapshotIds] });
+	} catch (error) {
+		if (error instanceof TencentApiError && /NotFound/i.test(error.code)) return;
+		throw error;
+	}
+}
+
 export async function createSnapshot(tc: TencentCloud, diskId: string, name: string): Promise<string> {
 	const result = await tc.cbs<{ SnapshotId: string }>("CreateSnapshot", { DiskId: diskId, SnapshotName: name });
 	return result.SnapshotId;

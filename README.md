@@ -25,18 +25,20 @@ The VM needs no inbound ports: the agent dials out to the Worker.
 
 ## What survives a VM replacement
 
-Everything that matters lives on one elastic cloud disk (`/data`). The disk is created with "release with instance"
-off, and it moves from VM to VM.
+Everything that matters lives on one elastic cloud disk (`/data`), 30 GB by default. The disk is created with
+"release with instance" off, and it moves from VM to VM. After 30 idle minutes it is saved as a snapshot and deleted,
+and the next start restores it (see [Lifecycle](#lifecycle)).
 
 | Data | Where | How it persists |
 |---|---|---|
 | pi-durable sessions (transcripts, tasks, checkpoints) | `/data/pi/sessions/<id>/session.sqlite` | Data disk. On boot the agent calls `harness.resume()`. |
 | Git working trees, including uncommitted changes and stashes | `/data/work/<session-id>` | Data disk. A stale `.git/index.lock` is removed on boot. Optionally a WIP snapshot is pushed on reclaim (`"PI_WIP_PUSH": "1"` in `AGENT_ENV`). |
-| gh / git credentials | `GH_TOKEN` in the `AGENT_ENV` secret | Delivered to the agent on every connect and never written to disk. `gh auth setup-git` makes git use it. |
+| gh / git credentials | `GH_TOKEN` in the `AGENT_ENV` secret | Delivered to the agent on every connect and never written to disk. git gets it through `gh auth git-credential`. |
 | Git identity, `~/.config`, shell history | `HOME=/data/home` | Data disk. |
 | Model logins (Claude Pro/Max, ChatGPT, Copilot, API keys entered in the panel) | `/data/home/.pi/agent/auth.json` | Data disk, in pi's own format. Refreshed OAuth tokens are written back. |
 | Model API keys from `AGENT_ENV` | `AGENT_ENV` secret | Delivered on every connect. |
 | Node.js | `/data/cache/node-*` | Downloaded once, then reused. |
+| Global `AGENTS.md` and skills | `/data/home/.pi/agent/AGENTS.md`, `/data/home/.pi/agent/skills/` | Data disk; see [What pi features the agent has](#what-pi-features-the-agent-has). |
 | Session list, queued messages, transcript mirror | Hub Durable Object | Cloudflare. Available while no VM is running. |
 
 What does **not** survive: running processes (dev servers, watchers), and system packages installed with `sudo apt` on
@@ -55,12 +57,13 @@ pi-durable records each tool call before running it. After a restart:
 
 | Event | What the Hub does |
 |---|---|
-| A session has work (new session, queued message, or busy when the VM died) and no VM exists | 1. Creates the data disk on first use.<br>2. Picks the best matching spot type in the disk's zone.<br>3. Calls `RunInstances` (SPOTPAID) with a boot script.<br>4. Attaches the disk once the instance is RUNNING. |
+| A session has work (new session, queued message, or busy when the VM died) and no VM exists | 1. If no disk exists, creates one: from the latest snapshot if there is one, otherwise empty. It goes in the zone with the best matching spot capacity.<br>2. Picks the best matching spot type in the disk's zone.<br>3. Calls `RunInstances` (SPOTPAID) with a boot script.<br>4. Attaches the disk once the instance is RUNNING. |
 | Agent connects | Sends secrets, sessions and queued messages. The agent opens every session and resumes unfinished work. |
 | Spot reclaim notice (agent polls `metadata.tencentyun.com/.../spot/termination-time` every 5 s) | 1. Launches the replacement immediately; the reclaimed type goes on a 30-minute cooldown.<br>2. The old agent keeps working until 60 s before the reclaim, then checkpoints, syncs and stops.<br>3. The Hub detaches the disk from the old VM, terminates it, and attaches the disk to the new VM. |
 | VM disappears without notice | The Hub finds it gone or terminating, then launches and attaches a replacement. |
 | Agent offline for 5 minutes, or never connects within 20 minutes | The Hub replaces the VM. |
 | All sessions idle for `idleMinutes` | The Hub tells the agent to shut down, then detaches the disk and terminates the VM. The disk stays. |
+| Disk idle for `archiveAfterMinutes` (default 30) | 1. Snapshots the disk.<br>2. Deletes the disk once the snapshot is complete. If work arrives first, the disk is kept and the snapshot becomes the backup.<br>3. Deletes the previous snapshot once the new one is complete. While idle you pay only for the snapshot; a start takes 1–3 minutes longer. |
 | No matching spot capacity in the disk's zone for 10 minutes | 1. Snapshots the disk and creates a copy in a zone that has capacity.<br>2. Continues there.<br>3. Keeps the old disk and snapshot for you to delete. |
 
 The Hub schedules itself with Durable Object alarms. Alarms are stored durably and retried by Cloudflare if they fail.
@@ -70,6 +73,27 @@ The Hub schedules itself with Durable Object alarms. Alarms are stored durably a
 
 The 15-minute cron is only a watchdog. Instances carry the tag `pi-spot=<NAME_PREFIX>`; tagged instances the Hub
 doesn't know about are terminated.
+
+## What pi features the agent has
+
+The agent runs pi-durable rather than the `pi` CLI, and adds pi's pieces on top. pi's own durable coding agent lives
+in pi's repository under `packages/coding-agent/src/experimental/durable`, but it isn't published, so these are
+ports of it (MIT):
+
+| Feature | Status |
+|---|---|
+| `read`, `write`, `edit`, `bash` tools | pi-durable's, the same four core tools as pi. Reading images is not supported yet. |
+| System prompt | pi's sections and tool guidance, plus rules for running on a replaceable spot VM. |
+| Context files | pi's rules: `AGENTS.override.md`, `AGENTS.md` or `CLAUDE.md` from `~/.pi/agent`, then from each directory from `/` down to the session's working directory. Re-read at most every 30 s. |
+| Skills | `~/.pi/agent/skills/` and `<repo>/.pi/skills/`, discovered and listed the way pi does; `disable-model-invocation` hides one. |
+| Subagents | A `subagent` tool, as in pi's durable agent: it runs a task in a child conversation with the same tools and returns the answer. It survives a VM replacement. |
+| Compaction | Automatic, from pi-durable: background summaries near the context limit, plus one retry after a context overflow. **Compact** in a session's header runs it now, with optional instructions. |
+| New context | **New context** starts a fresh context from an optional handoff note; the history stays stored. |
+| Retries, steering, follow-ups, abort, per-session model and thinking level, cost | From pi-durable. |
+| Not available | MCP/codemode, pi extensions and packages, prompt templates, `@file` mentions, `!` commands, branching (fork/tree) in the UI. |
+
+Put shared instructions in `~/.pi/agent/AGENTS.md` and skills in `~/.pi/agent/skills/` on the data disk; the agent
+can create them itself if you ask a session to.
 
 ## Model logins and subscriptions
 
@@ -138,7 +162,8 @@ How a type is chosen:
         "cvm:RunInstances", "cvm:DescribeInstances", "cvm:TerminateInstances",
         "cvm:DescribeZoneInstanceConfigInfos", "cvm:DescribeImages",
         "cvm:CreateDisks", "cvm:DescribeDisks", "cvm:AttachDisks", "cvm:DetachDisks",
-        "cvm:ModifyDiskAttributes", "cvm:CreateSnapshot", "cvm:DescribeSnapshots",
+        "cvm:ModifyDiskAttributes", "cvm:TerminateDisks",
+        "cvm:CreateSnapshot", "cvm:DescribeSnapshots", "cvm:DeleteSnapshots",
         "cvm:DescribeSecurityGroups", "cvm:CreateSecurityGroup",
         "vpc:CreateSecurityGroupWithPolicies", "vpc:CreateSecurityGroupPolicies", "vpc:CreateDefaultVpc",
         "finance:trade",
@@ -202,8 +227,9 @@ A deploy only changes the agent for VMs started after it. A running VM keeps its
 
 | Var | Default | Notes |
 |---|---|---|
-| `DATA_DISK_TYPE` / `DATA_DISK_GB` | `CLOUD_BSSD` / `100` | Used when the data disk is first created. |
-| `SYSTEM_DISK_TYPE` / `SYSTEM_DISK_GB` | `CLOUD_BSSD` / `50` | |
+| `DATA_DISK_TYPE` / `DATA_DISK_GB` | `CLOUD_BSSD` / `30` | Used when a data disk is created; a disk restored from a snapshot is at least as large as the one it was taken from. |
+| `ARCHIVE_AFTER_MINUTES` | `30` | Idle minutes before the data disk is snapshotted and deleted. Empty keeps it. Also in Settings. |
+| `SYSTEM_DISK_TYPE` / `SYSTEM_DISK_GB` | `CLOUD_BSSD` / `30` | Billed only while a VM runs. |
 | `BANDWIDTH_MBPS` | `100` | Billed by traffic. |
 | `NODE_MAJOR` | `24` | Node.js major version installed on the VM. |
 | `AGENT_SUDO` | `true` | Passwordless sudo for the agent user. |
@@ -241,7 +267,8 @@ PI_HUB_URL=http://127.0.0.1:8787 PI_INSTANCE_ID=local PI_AGENT_TOKEN=<LOCAL_AGEN
   - `/var/log/pi-spot-bootstrap.log` has the boot script output.
   - `journalctl -u pi-spot-agent` has the agent output.
 - **Costs.**
-  - The data disk is billed continuously, even with no VM running.
+  - The data disk is billed while it exists. Once it has been idle for `archiveAfterMinutes`, only its snapshot is
+    billed until the next start.
   - The VM is billed only while it runs; the spot price covers CPU and memory only.
   - Public traffic is billed per GB.
 - **Archiving** a session hides it and stops its run. Its files stay on the data disk.
@@ -256,6 +283,9 @@ PI_HUB_URL=http://127.0.0.1:8787 PI_INSTANCE_ID=local PI_AGENT_TOKEN=<LOCAL_AGEN
   - the default-VPC behaviour of `CreateDefaultVpc` on your account.
 - `@earendil-works/pi-durable` is experimental and its API changes without notice. It is pinned to `1.0.0`.
 - One VM serves all sessions.
+- Tencent disks can only grow. To get a smaller disk, use **Settings → Replace data disk**. It deletes the disk, its
+  snapshots, session state, workspaces and saved logins, and archives all sessions; the next start creates an empty
+  disk at the configured size.
 - The agent can read every secret in `AGENT_ENV`, because it needs them to work. Scope tokens accordingly.
 - If the reclaim notice is missed (abrupt loss), side effects of the step in flight, such as `git push` or opening a
   PR, can happen again when the model retries. The system prompt asks it to check first.
