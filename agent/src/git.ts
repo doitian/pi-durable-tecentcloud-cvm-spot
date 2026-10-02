@@ -18,7 +18,11 @@ export async function configureGit(): Promise<void> {
 	if (name) await run("git", ["config", "--global", "user.name", name]);
 	if (email) await run("git", ["config", "--global", "user.email", email]);
 	if (process.env.GH_TOKEN || process.env.GITHUB_TOKEN) {
-		await run("gh", ["auth", "setup-git"]).catch((error) => console.warn("gh auth setup-git failed:", error.message));
+		// What `gh auth setup-git` writes, without its check for a stored login: an env token is all there is here.
+		const key = "credential.https://github.com.helper";
+		await run("git", ["config", "--global", "--unset-all", key]).catch(() => undefined);
+		await run("git", ["config", "--global", "--add", key, ""]);
+		await run("git", ["config", "--global", "--add", key, "!gh auth git-credential"]);
 	}
 }
 
