@@ -624,7 +624,8 @@ function renderLoginFlow() {
       ? h("select", {}, ...prompt.options.map((o) => h("option", { value: o.id }, o.description ? `${o.label} (${o.description})` : o.label)))
       : h("input", { type: prompt.type === "secret" ? "password" : "text", placeholder: prompt.placeholder || "", autocomplete: "off" });
     const submit = () => {
-      if (!field.value) return;
+      // Plain text prompts may take an empty answer, e.g. "GitHub Enterprise domain (blank for github.com)".
+      if (!field.value && prompt.type !== "text") return;
       sendUi({ t: "login_reply", loginId: login.id, promptId, value: field.value });
       login.prompt = null;
       renderLogins();

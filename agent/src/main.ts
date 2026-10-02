@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { CredentialStore, OAuthAuth } from "@earendil-works/pi-ai";
+import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
 import type { MutableModels } from "@earendil-works/pi-ai/models";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -16,6 +17,9 @@ import { watchSpotTermination } from "./spot.ts";
 
 const context = BACKGROUND_CONTEXT;
 const config = loadConfig();
+
+// pi-ai loads OAuth flows through import() specifiers a bundler cannot follow; register them statically instead.
+registerBunOAuthFlows();
 
 // Seconds before the reclaim time at which the agent checkpoints and stops.
 const RECLAIM_STOP_LEAD_MS = 60_000;
