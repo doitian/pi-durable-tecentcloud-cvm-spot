@@ -3,12 +3,14 @@ import type {
 	AgentToHub,
 	AuthReport,
 	HubToAgent,
+	HubToTerm,
 	HubToUi,
 	InstancePhase,
 	PanelState,
 	SessionReport,
 	SessionSpec,
 	SessionView,
+	TermToHub,
 	ThinkingLevel,
 	UiToHub,
 } from "../../shared/protocol.ts";
@@ -132,7 +134,15 @@ type SessionRow = {
 	pending_abort: number;
 };
 
-type SocketAttachment = { kind: "agent"; instanceId: string } | { kind: "ui"; sessionId: string | null };
+type SocketAttachment =
+	| { kind: "agent"; instanceId: string }
+	| { kind: "ui"; sessionId: string | null }
+	| { kind: "term"; termId: string };
+
+function clampDimension(value: string | null, fallback: number, min: number): number {
+	const parsed = Number(value);
+	return Number.isInteger(parsed) && parsed >= min && parsed <= 1000 ? parsed : fallback;
+}
 
 export interface CreateSessionInput {
 	title?: string;
@@ -581,6 +591,23 @@ export class Hub extends DurableObject<Env> {
 			for (const old of this.ctx.getWebSockets(`agent:${instanceId}`)) old.close(4000, "replaced");
 			this.ctx.acceptWebSocket(server, ["agent", `agent:${instanceId}`]);
 			server.serializeAttachment({ kind: "agent", instanceId } satisfies SocketAttachment);
+		} else if (url.pathname === "/api/term/ws") {
+			// The Worker checked the admin token. Bytes are relayed, never stored or logged.
+			const termId = crypto.randomUUID();
+			const sessionId = url.searchParams.get("session") || null;
+			this.ctx.acceptWebSocket(server, ["term", `term:${termId}`]);
+			server.serializeAttachment({ kind: "term", termId } satisfies SocketAttachment);
+			const opened = this.sendToAgent({
+				t: "term_open",
+				termId,
+				sessionId,
+				cols: clampDimension(url.searchParams.get("cols"), 80, 10),
+				rows: clampDimension(url.searchParams.get("rows"), 24, 5),
+			});
+			if (!opened) {
+				server.send(JSON.stringify({ t: "error", message: "No VM is online. Start it first." } satisfies HubToTerm));
+				server.close(4002, "no agent");
+			}
 		} else if (url.pathname === "/api/ui/ws") {
 			await this.notePublicUrl(url.origin);
 			this.ctx.acceptWebSocket(server, ["ui"]);
@@ -644,6 +671,7 @@ export class Hub extends DurableObject<Env> {
 		if (!attachment || typeof data !== "string") return;
 		try {
 			if (attachment.kind === "agent") await this.onAgentMessage(ws, attachment.instanceId, JSON.parse(data) as AgentToHub);
+			else if (attachment.kind === "term") this.onTermMessage(attachment.termId, JSON.parse(data) as TermToHub);
 			else this.onUiMessage(ws, JSON.parse(data) as UiToHub);
 		} catch (error) {
 			this.log("error", `websocket message: ${errorMessage(error)}`);
@@ -652,8 +680,19 @@ export class Hub extends DurableObject<Env> {
 
 	override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
 		const attachment = ws.deserializeAttachment() as SocketAttachment | null;
+		if (attachment?.kind === "term") {
+			// Detaches the tmux client; the tmux session keeps running on the VM.
+			this.sendToAgent({ t: "term_close", termId: attachment.termId });
+			return;
+		}
 		if (attachment?.kind !== "agent") return;
 		this.log("warn", `agent ${attachment.instanceId} disconnected (${code} ${reason})`);
+		if (attachment.instanceId === this.currentInstanceId()) {
+			for (const terminal of this.ctx.getWebSockets("term")) {
+				this.sendToTerm(terminal, { t: "error", message: "The agent disconnected." });
+				terminal.close(4003, "agent disconnected");
+			}
+		}
 		for (const loginId of this.activeLogins) {
 			this.sendToUis({ t: "login_done", loginId, ok: false, error: "the agent disconnected" });
 		}
@@ -667,6 +706,26 @@ export class Hub extends DurableObject<Env> {
 
 	override async webSocketError(ws: WebSocket): Promise<void> {
 		await this.webSocketClose(ws, 1006, "error");
+	}
+
+	private onTermMessage(termId: string, message: TermToHub): void {
+		if (message.t === "input") this.sendToAgent({ t: "term_input", termId, data: message.data });
+		else if (message.t === "resize") {
+			this.sendToAgent({
+				t: "term_resize",
+				termId,
+				cols: clampDimension(String(message.cols), 80, 10),
+				rows: clampDimension(String(message.rows), 24, 5),
+			});
+		}
+	}
+
+	private sendToTerm(ws: WebSocket | undefined, message: HubToTerm): void {
+		try {
+			ws?.send(JSON.stringify(message));
+		} catch {
+			// The browser went away; its close handler detaches the shell.
+		}
 	}
 
 	private onUiMessage(ws: WebSocket, message: UiToHub): void {
@@ -806,6 +865,15 @@ export class Hub extends DurableObject<Env> {
 			case "login_prompt_closed":
 				this.sendToUis(message);
 				return;
+			case "term_output":
+				this.sendToTerm(this.ctx.getWebSockets(`term:${message.termId}`)[0], { t: "output", data: message.data });
+				return;
+			case "term_exit": {
+				const terminal = this.ctx.getWebSockets(`term:${message.termId}`)[0];
+				this.sendToTerm(terminal, { t: "exit", code: message.code, ...(message.error ? { error: message.error } : {}) });
+				terminal?.close(1000, "shell exited");
+				return;
+			}
 			case "login_done":
 				this.activeLogins.delete(message.loginId);
 				this.log(message.ok ? "info" : "warn", `login ${message.ok ? "succeeded" : `failed: ${message.error}`}`);

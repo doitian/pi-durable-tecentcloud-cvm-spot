@@ -31,7 +31,7 @@ INSTANCE_ID=$(curl -fsS --retry 20 --retry-delay 2 "$META/instance-id")
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -y -q git ripgrep jq curl ca-certificates xz-utils build-essential python3
+apt-get install -y -q git ripgrep jq curl ca-certificates xz-utils build-essential python3 tmux
 if ! command -v gh >/dev/null; then
   install -d -m 0755 /etc/apt/keyrings
   curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg

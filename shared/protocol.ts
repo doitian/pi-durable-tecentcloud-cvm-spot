@@ -90,6 +90,9 @@ export type AgentToHub =
 	| { t: "log"; level: "info" | "warn" | "error"; message: string }
 	| ({ t: "auth" } & AuthReport)
 	| LoginMessage
+	/** Terminal output, base64 because it is raw PTY bytes. */
+	| { t: "term_output"; termId: string; data: string }
+	| { t: "term_exit"; termId: string; code: number | null; error?: string }
 	| { t: "ping" };
 
 export type HubToAgent =
@@ -113,6 +116,11 @@ export type HubToAgent =
 	| { t: "login_reply"; loginId: string; promptId: string; value: string }
 	| { t: "login_cancel"; loginId: string }
 	| { t: "logout"; provider: string }
+	/** Opens a shell attached to the tmux session of `sessionId`, or the VM-wide one when null. */
+	| { t: "term_open"; termId: string; sessionId: string | null; cols: number; rows: number }
+	| { t: "term_input"; termId: string; data: string }
+	| { t: "term_resize"; termId: string; cols: number; rows: number }
+	| { t: "term_close"; termId: string }
 	| { t: "pong" };
 
 export type InstancePhase = "launching" | "booting" | "attaching" | "running" | "draining";
@@ -162,6 +170,14 @@ export type HubToUi =
 	| { t: "transcript"; sessionId: string; entries: unknown[]; snapshot?: unknown }
 	| { t: "events"; sessionId: string; events: unknown[] }
 	| LoginMessage;
+
+/** Browser terminal socket (`/api/term/ws`) to the Hub; `data` is base64 of UTF-8 or raw bytes. */
+export type TermToHub = { t: "input"; data: string } | { t: "resize"; cols: number; rows: number };
+
+export type HubToTerm =
+	| { t: "output"; data: string }
+	| { t: "exit"; code: number | null; error?: string }
+	| { t: "error"; message: string };
 
 export type UiToHub =
 	| { t: "subscribe"; sessionId: string | null }

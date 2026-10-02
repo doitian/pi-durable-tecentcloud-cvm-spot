@@ -90,10 +90,28 @@ ports of it (MIT):
 | Compaction | Automatic, from pi-durable: background summaries near the context limit, plus one retry after a context overflow. **Compact** in a session's header runs it now, with optional instructions. |
 | New context | **New context** starts a fresh context from an optional handoff note; the history stays stored. |
 | Retries, steering, follow-ups, abort, per-session model and thinking level, cost | From pi-durable. |
-| Not available | MCP/codemode, pi extensions and packages, prompt templates, `@file` mentions, `!` commands, branching (fork/tree) in the UI. |
+| Not available | MCP/codemode, pi extensions and packages, prompt templates, `@file` mentions, `!` commands (use the web terminal), branching (fork/tree) in the UI. |
 
 Put shared instructions in `~/.pi/agent/AGENTS.md` and skills in `~/.pi/agent/skills/` on the data disk; the agent
 can create them itself if you ask a session to.
+
+## Web terminal
+
+**Shell** in a session's header opens a terminal in that session's workspace. It runs in a tmux session named
+`pi-<first 8 characters of the session ID>`. **Shell** in the top bar opens a VM-wide one, tmux session `pi-shell`,
+in `HOME`.
+- **Reattaching:** opening a shell runs `tmux new-session -A`, so it reattaches when the tmux session exists.
+- **Closing:** closing the dialog only detaches. The tmux session keeps running until the VM is replaced; a new VM
+  starts fresh ones.
+- **Environment:** the shell runs as the agent's user, with the agent's environment (including `AGENT_ENV`, so `gh`
+  works) and passwordless sudo.
+
+There is no extra port or daemon. The bytes travel over the connections that already exist: browser ⇄ Hub ⇄ the
+agent's outbound WebSocket. On the VM a small Python helper gives tmux a real pseudo-terminal, including window
+resizes. Anyone with `ADMIN_TOKEN` gets a root-capable shell on the VM, which is one more reason to put Cloudflare
+Access in front of the page.
+
+In the message box, Enter sends and Shift+Enter starts a new line.
 
 ## Model logins and subscriptions
 

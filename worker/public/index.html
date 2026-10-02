@@ -73,6 +73,10 @@ details.thinking summary { color: var(--muted); cursor: pointer; font-size: 12.5
 .empty { margin: auto; color: var(--muted); text-align: center; padding: 40px; }
 dialog { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--text); padding: 18px; width: min(680px, calc(100vw - 32px)); }
 dialog::backdrop { background: rgba(0,0,0,.35); }
+dialog.term { width: min(1200px, calc(100vw - 16px)); height: min(760px, calc(100vh - 16px)); padding: 0; overflow: hidden; }
+dialog.term[open] { display: flex; flex-direction: column; }
+dialog.term .term-head { display: flex; gap: 10px; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+#termBox { flex: 1; min-height: 0; background: #0f0f0e; padding: 4px 0 0 6px; }
 dialog h2 { margin: 0 0 12px; font-size: 16px; }
 .form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
 .form label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); }
@@ -106,6 +110,7 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
   <span class="spacer"></span>
   <button id="startBtn" title="Start a VM now and keep it for one idle period">Start VM</button>
   <button id="stopBtn" title="Checkpoint and terminate the VM now">Stop VM</button>
+  <button id="shellBtn" title="A shell on the VM, in tmux session pi-shell">Shell</button>
   <button id="loginsBtn">Logins</button>
   <button id="settingsBtn">Settings</button>
 </header>
@@ -183,6 +188,17 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
   <div class="actions"><button id="loginsClose">Close</button></div>
 </dialog>
 <datalist id="modelOptions"></datalist>
+
+<dialog id="termDialog" class="term">
+  <div class="term-head">
+    <strong id="termTitle"></strong>
+    <span class="msg notice" id="termStatus"></span>
+    <span class="spacer"></span>
+    <span class="msg notice">Closing detaches; the tmux session keeps running until the VM is replaced.</span>
+    <button id="termClose">Close</button>
+  </div>
+  <div id="termBox"></div>
+</dialog>
 
 <script>
 "use strict";
@@ -389,7 +405,7 @@ function renderView() {
   const view = $("#view");
   const session = currentSession();
   if (!session) { view.replaceChildren(h("div", { class: "empty" }, "Select or create a session.")); return; }
-  const input = h("textarea", { id: "promptInput", rows: "2", placeholder: "Message the agent (Ctrl+Enter to send)" });
+  const input = h("textarea", { id: "promptInput", rows: "2", placeholder: "Message the agent (Enter to send, Shift+Enter for a new line)" });
   const steer = h("input", { type: "checkbox", id: "steerInput" });
   const send = async () => {
     const content = input.value.trim();
@@ -398,7 +414,13 @@ function renderView() {
     try { await api(`/sessions/${currentId}/input`, { method: "POST", body: JSON.stringify({ content, steer: steer.checked }) }); }
     catch (error) { showError(error.message); input.value = content; }
   };
-  input.addEventListener("keydown", (event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); send(); } });
+  input.addEventListener("keydown", (event) => {
+    // Enter sends; Shift+Enter inserts a new line; Enter that confirms an IME composition does neither.
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+      event.preventDefault();
+      send();
+    }
+  });
   view.replaceChildren(
     h("div", { id: "viewHead" }),
     h("div", { id: "transcript" }),
@@ -420,6 +442,7 @@ function renderHead() {
     h("span", { class: "meta" }, session.repoUrl ? `${session.repoUrl} · ` : "", label, session.costUsd ? ` · $${session.costUsd.toFixed(2)}` : ""),
     session.error ? h("span", { class: "meta", style: "color: var(--err)" }, session.error) : "",
     h("span", { class: "spacer" }),
+    h("button", { title: `Shell in the session's workspace, in tmux session pi-${session.id.slice(0, 8)}`, onclick: () => openShell(session.id, `${session.title} · tmux pi-${session.id.slice(0, 8)}`) }, "Shell"),
     h("button", { title: "Summarize older context now", onclick: () => {
       const instructions = prompt("Compact the context now. Optional: what the summary must keep.", "");
       if (instructions !== null) api(`/sessions/${session.id}/compact`, { method: "POST", body: JSON.stringify({ instructions }) }).catch((e) => showError(e.message));
@@ -748,6 +771,90 @@ $("#replaceDiskBtn").addEventListener("click", async () => {
     $("#settingsDialog").close();
   } catch (error) { showError(error.message); }
 });
+
+let xtermReady;
+function loadXterm() {
+  const load = (tag, attrs) => new Promise((resolve, reject) => {
+    const el = Object.assign(document.createElement(tag), attrs);
+    el.onload = resolve;
+    el.onerror = () => reject(new Error(`could not load ${attrs.src || attrs.href}`));
+    document.head.append(el);
+  });
+  xtermReady ??= Promise.all([
+    load("link", { rel: "stylesheet", href: "https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.css" }),
+    load("script", { src: "https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/lib/xterm.js" }),
+    load("script", { src: "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.js" }),
+  ]).catch((error) => { xtermReady = undefined; throw error; });
+  return xtermReady;
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(binary);
+}
+
+function base64ToBytes(text) {
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+let closeShell = null;
+
+async function openShell(sessionId, title) {
+  if (!state.instance?.agentConnected) { showError("No VM is online. Start it first."); return; }
+  try { await loadXterm(); } catch (error) { showError(error.message); return; }
+  closeShell?.();
+  const dialog = $("#termDialog");
+  $("#termTitle").textContent = title;
+  $("#termStatus").textContent = "connecting…";
+  dialog.showModal();
+  const term = new Terminal({ cursorBlink: true, fontSize: 13, scrollback: 10000, fontFamily: "ui-monospace, Menlo, Consolas, monospace", theme: { background: "#0f0f0e" } });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open($("#termBox"));
+  // Fit only to a laid-out box; a hidden or zero-size one would shrink the shell to a sliver.
+  const refit = () => {
+    const size = fit.proposeDimensions();
+    if (size && size.cols >= 20 && size.rows >= 5) fit.fit();
+  };
+  // Let the dialog lay out first; animation frames never come in a background tab, hence the timeout.
+  await new Promise((resolve) => { requestAnimationFrame(resolve); setTimeout(resolve, 100); });
+  refit();
+  if (term.cols < 20 || term.rows < 5) term.resize(100, 30);
+  const query = new URLSearchParams({ token, cols: String(term.cols), rows: String(term.rows), ...(sessionId ? { session: sessionId } : {}) });
+  const ws = new WebSocket(`${location.origin.replace(/^http/, "ws")}/api/term/ws?${query}`);
+  const encoder = new TextEncoder();
+  const send = (message) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message)); };
+  ws.onopen = () => { $("#termStatus").textContent = ""; term.focus(); };
+  ws.onmessage = (event) => {
+    const message = JSON.parse(event.data);
+    if (message.t === "output") term.write(base64ToBytes(message.data));
+    else if (message.t === "exit") $("#termStatus").textContent = message.error ? `shell exited: ${message.error}` : "shell exited";
+    else if (message.t === "error") $("#termStatus").textContent = message.message;
+  };
+  ws.onclose = () => { if (!$("#termStatus").textContent) $("#termStatus").textContent = "disconnected"; };
+  term.onData((data) => send({ t: "input", data: bytesToBase64(encoder.encode(data)) }));
+  term.onBinary((data) => send({ t: "input", data: btoa(data) }));
+  term.onResize(({ cols, rows }) => send({ t: "resize", cols, rows }));
+  const observer = new ResizeObserver(refit);
+  observer.observe($("#termBox"));
+  closeShell = () => {
+    closeShell = null;
+    observer.disconnect();
+    ws.close();
+    term.dispose();
+    $("#termBox").replaceChildren();
+    if (dialog.open) dialog.close();
+  };
+}
+
+// Escape belongs to the shell (vim, less), not to the dialog.
+$("#termDialog").addEventListener("cancel", (event) => event.preventDefault());
+$("#termClose").addEventListener("click", () => closeShell?.());
+$("#shellBtn").addEventListener("click", () => openShell(null, "VM shell · tmux pi-shell"));
 
 $("#startBtn").addEventListener("click", () => api("/instance/start", { method: "POST" }).catch((e) => showError(e.message)));
 $("#stopBtn").addEventListener("click", () => { if (confirm("Stop the VM now? Running work is checkpointed and resumes on the next VM.")) api("/instance/stop", { method: "POST" }).catch((e) => showError(e.message)); });

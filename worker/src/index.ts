@@ -78,7 +78,7 @@ export default {
 		if (url.pathname.startsWith("/api/")) {
 			const denial = adminDenial(request, url, env);
 			if (denial) return json({ error: denial }, 401);
-			if (url.pathname === "/api/ui/ws") return hub(env).fetch(request);
+			if (url.pathname === "/api/ui/ws" || url.pathname === "/api/term/ws") return hub(env).fetch(request);
 			try {
 				return await api(request, url, env);
 			} catch (error) {

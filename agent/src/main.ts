@@ -14,6 +14,7 @@ import { HubClient } from "./hub-client.ts";
 import { LoginManager } from "./login.ts";
 import { SessionManager } from "./sessions.ts";
 import { watchSpotTermination } from "./spot.ts";
+import { Terminals } from "./terminal.ts";
 
 const context = BACKGROUND_CONTEXT;
 const config = loadConfig();
@@ -27,6 +28,11 @@ const RECLAIM_STOP_LEAD_MS = 60_000;
 const credentials = new FileCredentialStore(join(config.agentDir, "auth.json"));
 let manager: SessionManager | undefined;
 let logins: LoginManager | undefined;
+const terminals = new Terminals({
+	output: (termId, data) => void hub.send({ t: "term_output", termId, data }),
+	exit: (termId, code, error) => void hub.send({ t: "term_exit", termId, code, ...(error ? { error } : {}) }),
+});
+const SESSION_ID = /^[0-9a-f-]{36}$/;
 let stopping = false;
 
 const wsUrl =
@@ -150,6 +156,26 @@ async function handle(message: HubToAgent): Promise<void> {
 			await manager?.reset(message.sessionId, message.handoff);
 			log("info", `new context started for session ${message.sessionId}`);
 			return;
+		case "term_open": {
+			// One tmux session per agent session, in its workspace; the VM-wide shell starts in HOME.
+			if (message.sessionId !== null && !SESSION_ID.test(message.sessionId)) {
+				hub.send({ t: "term_exit", termId: message.termId, code: null, error: "bad session id" });
+				return;
+			}
+			const tmuxSession = message.sessionId ? `pi-${message.sessionId.slice(0, 8)}` : "pi-shell";
+			const cwd = message.sessionId ? join(config.workDir, message.sessionId) : (process.env.HOME ?? config.dataDir);
+			terminals.start(message.termId, tmuxSession, cwd, message.cols, message.rows);
+			return;
+		}
+		case "term_input":
+			terminals.input(message.termId, message.data);
+			return;
+		case "term_resize":
+			terminals.resize(message.termId, message.cols, message.rows);
+			return;
+		case "term_close":
+			terminals.close(message.termId);
+			return;
 		case "shutdown":
 			await stop(`shutdown: ${message.reason}`, false);
 			return;
@@ -185,6 +211,7 @@ async function stop(reason: string, wipPush: boolean): Promise<void> {
 	stopping = true;
 	stopSpotWatch();
 	log("info", `stopping (${reason})`);
+	terminals.closeAll();
 	await manager?.closeAll();
 	if (wipPush && process.env.PI_WIP_PUSH === "1") {
 		for (const session of manager?.all ?? []) {
