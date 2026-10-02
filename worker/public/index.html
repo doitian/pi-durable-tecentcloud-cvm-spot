@@ -24,6 +24,7 @@
   --user: #22293a; --code: #262624; --shadow: none; color-scheme: dark;
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; height: 100vh; display: flex; flex-direction: column; }
 button, input, select, textarea { font: inherit; color: inherit; }
 button { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
@@ -450,8 +451,11 @@ function renderState() {
   }
   const disk = $("#diskPill");
   disk.hidden = !state.disk && !state.archive;
-  if (state.disk) disk.textContent = `disk ${state.disk.id} · ${state.disk.sizeGb} GB · ${state.disk.zone}`;
-  else if (state.archive) disk.textContent = `disk saved as snapshot ${state.archive.snapshotId} · ${state.archive.sizeGb} GB · restored on next start`;
+  disk.textContent = state.disk
+    ? `disk ${state.disk.id} · ${state.disk.sizeGb} GB · ${state.disk.zone}`
+    : state.archive
+      ? `disk saved as snapshot ${state.archive.snapshotId} · ${state.archive.sizeGb} GB · restored on next start`
+      : "";
   showError(state.lastError && Date.now() - state.lastError.at < 30 * 60_000 ? `${state.lastError.message} (${fmtTime(state.lastError.at)})` : "");
 
   const list = $("#sessions");
