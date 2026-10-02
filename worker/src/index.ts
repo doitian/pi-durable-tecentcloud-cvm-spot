@@ -44,10 +44,17 @@ async function api(request: Request, url: URL, env: Env): Promise<Response> {
 	if (method === "PUT" && path === "/settings") return json(await stub.updateSettings(await body<Partial<Settings>>()));
 	if (method === "GET" && path === "/candidates") return json(await stub.candidates());
 	if (method === "POST" && path === "/sessions") return json(await stub.createSession(await body<CreateSessionInput>()), 201);
+	if (method === "GET" && path === "/sessions/archived") return json(await stub.archivedSessions());
+	if (method === "POST" && path === "/sessions/unarchive") {
+		return json({ resumed: await stub.unarchiveSessions((await body<{ ids: string[] }>()).ids ?? []) });
+	}
+	if (method === "POST" && path === "/sessions/delete") {
+		return json({ deleted: await stub.deleteSessions((await body<{ ids: string[] }>()).ids ?? []) });
+	}
 	if (method === "POST" && path === "/instance/start") return json(await stub.startInstance());
 	if (method === "POST" && path === "/instance/stop") return json(await stub.stopInstance());
 	if (method === "POST" && path === "/reconcile") return json(await stub.tick());
-	if (method === "POST" && path === "/disk/replace") return json(await stub.replaceDataDisk());
+	if (method === "POST" && path === "/disk/delete") return json(await stub.deleteDataDisk());
 	if (session) {
 		const [, id, action] = session as unknown as [string, string, string | undefined];
 		if (method === "GET" && action === "/transcript") return json(await stub.transcript(id));

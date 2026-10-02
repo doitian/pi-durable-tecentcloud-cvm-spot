@@ -132,6 +132,7 @@ async function handle(message: HubToAgent): Promise<void> {
 			manager.sync(message.sessions);
 			for (const input of message.inputs) void manager.submit(input);
 			for (const sessionId of message.aborts) void abort(sessionId);
+			if (message.purges.length > 0) void purge(message.purges);
 			hub.send({ t: "ready", sessions: manager.reports() });
 			await publishAuth();
 			return;
@@ -147,6 +148,12 @@ async function handle(message: HubToAgent): Promise<void> {
 			return;
 		case "resync":
 			await manager?.resync(message.sessionId);
+			return;
+		case "close_session":
+			await manager?.remove(message.sessionId);
+			return;
+		case "purge":
+			await purge(message.sessionIds);
 			return;
 		case "compact":
 			await manager?.compact(message.sessionId, message.instructions);
@@ -199,6 +206,13 @@ async function handle(message: HubToAgent): Promise<void> {
 
 async function publishAuth(): Promise<void> {
 	if (logins) hub.send({ t: "auth", ...(await logins.report()) });
+}
+
+async function purge(sessionIds: string[]): Promise<void> {
+	const valid = sessionIds.filter((id) => SESSION_ID.test(id));
+	await manager?.purge(valid);
+	log("info", `deleted ${valid.length} session(s) from the data disk`);
+	hub.send({ t: "purged", sessionIds: valid });
 }
 
 async function abort(sessionId: string): Promise<void> {

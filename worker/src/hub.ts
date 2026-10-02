@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type {
 	AgentToHub,
+	ArchivedSessionView,
 	AuthReport,
 	HubToAgent,
 	HubToTerm,
@@ -206,6 +207,7 @@ export class Hub extends DurableObject<Env> {
 				session_id TEXT NOT NULL, entry_id INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (session_id, entry_id));
 			CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, level TEXT NOT NULL,
 				message TEXT NOT NULL);
+			CREATE TABLE IF NOT EXISTS purges (session_id TEXT PRIMARY KEY, requested_at INTEGER NOT NULL);
 		`);
 		ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping"}', '{"t":"pong"}'));
 	}
@@ -495,10 +497,71 @@ export class Hub extends DurableObject<Env> {
 
 	async archiveSession(sessionId: string): Promise<void> {
 		this.sendToAgent({ t: "abort", sessionId });
+		this.sendToAgent({ t: "close_session", sessionId });
 		this.sql.exec("UPDATE sessions SET archived = 1, busy = 0 WHERE id = ?", sessionId);
 		this.sql.exec("DELETE FROM inputs WHERE session_id = ? AND acked_at IS NULL", sessionId);
 		this.log("info", `session ${sessionId} archived (its files stay on the data disk)`);
 		await this.ensureAlarm(0);
+	}
+
+	async archivedSessions(): Promise<ArchivedSessionView[]> {
+		return this.sql
+			.exec<SessionRow>("SELECT * FROM sessions WHERE archived = 1 ORDER BY last_activity_at DESC")
+			.toArray()
+			.map((row) => {
+				const spec = JSON.parse(row.spec) as SessionSpec;
+				return {
+					id: spec.id,
+					title: spec.title,
+					...(spec.repoUrl ? { repoUrl: spec.repoUrl } : {}),
+					model: spec.model,
+					createdAt: row.created_at,
+					lastActivityAt: row.last_activity_at,
+					costUsd: row.cost,
+				};
+			});
+	}
+
+	private archivedIds(ids: readonly string[]): string[] {
+		const wanted = new Set(ids);
+		return this.sql
+			.exec<{ id: string }>("SELECT id FROM sessions WHERE archived = 1")
+			.toArray()
+			.map((row) => row.id)
+			.filter((id) => wanted.has(id));
+	}
+
+	/** Brings archived sessions back; an online agent reopens them at once, otherwise the next VM does. */
+	async unarchiveSessions(ids: readonly string[]): Promise<number> {
+		const resumed = this.archivedIds(ids);
+		for (const id of resumed) {
+			this.sql.exec("UPDATE sessions SET archived = 0, pending_abort = 0, last_activity_at = ? WHERE id = ?", Date.now(), id);
+			const row = this.sql.exec<{ spec: string }>("SELECT spec FROM sessions WHERE id = ?", id).one();
+			this.sendToAgent({ t: "session", session: JSON.parse(row.spec) as SessionSpec });
+		}
+		if (resumed.length > 0) this.log("info", `${resumed.length} archived session(s) resumed`);
+		this.scheduleBroadcast();
+		return resumed.length;
+	}
+
+	/**
+	 * Forgets archived sessions and deletes their files from the data disk: pi-durable state, workspace (uncommitted
+	 * changes included) and tmux session. With no agent online the file deletion waits for the next VM.
+	 */
+	async deleteSessions(ids: readonly string[]): Promise<number> {
+		const deleted = this.archivedIds(ids);
+		if (deleted.length === 0) return 0;
+		const now = Date.now();
+		for (const id of deleted) {
+			this.sql.exec("DELETE FROM sessions WHERE id = ?", id);
+			this.sql.exec("DELETE FROM inputs WHERE session_id = ?", id);
+			this.sql.exec("DELETE FROM entries WHERE session_id = ?", id);
+			this.sql.exec("INSERT OR REPLACE INTO purges (session_id, requested_at) VALUES (?, ?)", id, now);
+		}
+		const sent = this.sendToAgent({ t: "purge", sessionIds: deleted });
+		this.log("info", `${deleted.length} session(s) deleted${sent ? "" : "; their files are removed when the next VM starts"}`);
+		this.scheduleBroadcast();
+		return deleted.length;
 	}
 
 	async transcript(sessionId: string, limit = TRANSCRIPT_LIMIT): Promise<unknown[]> {
@@ -514,10 +577,10 @@ export class Hub extends DurableObject<Env> {
 	}
 
 	/**
-	 * Deletes the data disk and its snapshots so the next start creates a fresh one at the current size. Everything on
+	 * Deletes the data disk and its snapshots; the next start creates a fresh one at the configured size. Everything on
 	 * the disk goes: session state, workspaces and saved logins. Sessions are archived because they cannot continue.
 	 */
-	async replaceDataDisk(): Promise<void> {
+	async deleteDataDisk(): Promise<void> {
 		const cloud = this.loadCloud();
 		if (cloud.instance || cloud.retired.length > 0) throw new Error("Stop the VM and wait until it is gone first.");
 		const tc = this.tencent();
@@ -541,6 +604,7 @@ export class Hub extends DurableObject<Env> {
 		this.sql.exec("UPDATE sessions SET archived = 1 WHERE archived = 0");
 		this.sql.exec("DELETE FROM inputs WHERE acked_at IS NULL");
 		this.sql.exec("DELETE FROM kv WHERE key = 'auth'");
+		this.sql.exec("DELETE FROM purges");
 		this.log("warn", `data disk ${cloud.disk?.id ?? "(none)"} and ${snapshots.length} snapshot(s) deleted; sessions archived`);
 	}
 
@@ -791,12 +855,17 @@ export class Hub extends DurableObject<Env> {
 					.exec<{ id: string }>("SELECT id FROM sessions WHERE pending_abort = 1 AND archived = 0")
 					.toArray()
 					.map((row) => row.id);
+				const purges = this.sql
+					.exec<{ session_id: string }>("SELECT session_id FROM purges")
+					.toArray()
+					.map((row) => row.session_id);
 				const welcome: HubToAgent = {
 					t: "welcome",
 					env: this.agentEnv(),
 					sessions: this.specs(),
 					inputs: this.pendingInputs(),
 					aborts,
+					purges,
 				};
 				ws.send(JSON.stringify(welcome));
 				this.log("info", `agent ${instanceId} connected (v${message.agentVersion})`);
@@ -829,6 +898,9 @@ export class Hub extends DurableObject<Env> {
 				return;
 			case "aborted":
 				this.sql.exec("UPDATE sessions SET pending_abort = 0 WHERE id = ?", message.sessionId);
+				return;
+			case "purged":
+				for (const id of message.sessionIds) this.sql.exec("DELETE FROM purges WHERE session_id = ?", id);
 				return;
 			case "reclaim": {
 				if (this.loadCloud().instance?.id !== instanceId) return;
@@ -979,6 +1051,7 @@ export class Hub extends DurableObject<Env> {
 			...(instance ? { instance } : {}),
 			...(auth ? { auth } : {}),
 			sessions,
+			archivedCount: this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM sessions WHERE archived = 1").one().n,
 			...(cloud.disk ? { disk: { id: cloud.disk.id, zone: cloud.disk.zone, sizeGb: cloud.disk.sizeGb } } : {}),
 			...(cloud.archive && !cloud.disk ? { archive: { snapshotId: cloud.archive.snapshotId, sizeGb: cloud.archive.sizeGb, at: cloud.archive.at } } : {}),
 			...(cloud.lastError ? { lastError: cloud.lastError } : {}),

@@ -1,4 +1,5 @@
-import { mkdir } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import type { MutableModels } from "@earendil-works/pi-ai/models";
@@ -341,6 +342,25 @@ export class SessionManager {
 
 	async abort(sessionId: string): Promise<void> {
 		await this.sessions.get(sessionId)?.abort();
+	}
+
+	/** Closes an archived session; its files stay on the disk. */
+	async remove(sessionId: string): Promise<void> {
+		const session = this.sessions.get(sessionId);
+		if (!session) return;
+		this.sessions.delete(sessionId);
+		await session.close();
+	}
+
+	/** Deletes sessions for good: closes them, ends their tmux sessions and removes their state and workspaces. */
+	async purge(sessionIds: readonly string[]): Promise<void> {
+		for (const id of sessionIds) {
+			await this.remove(id);
+			await new Promise((resolve) => execFile("tmux", ["kill-session", "-t", `pi-${id.slice(0, 8)}`], () => resolve(undefined)));
+			for (const path of [join(this.config.sessionsDir, id), join(this.config.workDir, id), join(this.config.workDir, `${id}.cloning`)]) {
+				await rm(path, { recursive: true, force: true });
+			}
+		}
 	}
 
 	async compact(sessionId: string, instructions?: string): Promise<void> {

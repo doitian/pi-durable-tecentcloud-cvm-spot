@@ -85,6 +85,7 @@ export type AgentToHub =
 	| { t: "events"; sessionId: string; events: unknown[] }
 	| { t: "ack"; sessionId: string; requestId: string; error?: string }
 	| { t: "aborted"; sessionId: string }
+	| { t: "purged"; sessionIds: string[] }
 	| { t: "reclaim"; terminationTime: string }
 	| { t: "stopped"; reason: string }
 	| { t: "log"; level: "info" | "warn" | "error"; message: string }
@@ -103,6 +104,8 @@ export type HubToAgent =
 			inputs: PendingInput[];
 			/** Sessions whose abort was requested while no agent was connected. */
 			aborts: string[];
+			/** Deleted sessions whose files are still on the data disk. */
+			purges: string[];
 	  }
 	| { t: "session"; session: SessionSpec }
 	| { t: "input"; input: PendingInput }
@@ -110,6 +113,10 @@ export type HubToAgent =
 	/** Restart one session's event stream so a newly attached browser gets a full snapshot. */
 	| { t: "resync"; sessionId: string }
 	| { t: "compact"; sessionId: string; instructions?: string }
+	/** Archived: close the session; its files stay. */
+	| { t: "close_session"; sessionId: string }
+	/** Deleted: close the sessions and remove their state, workspaces and tmux sessions. */
+	| { t: "purge"; sessionIds: string[] }
 	| { t: "reset"; sessionId: string; handoff?: string }
 	| { t: "shutdown"; reason: string }
 	| { t: "login"; loginId: string; provider: string; type: "oauth" | "api_key" }
@@ -153,9 +160,20 @@ export interface SessionView {
 	costUsd?: number;
 }
 
+export interface ArchivedSessionView {
+	id: string;
+	title: string;
+	repoUrl?: string;
+	model: ModelRef;
+	createdAt: number;
+	lastActivityAt: number;
+	costUsd?: number;
+}
+
 export interface PanelState {
 	instance?: InstanceView;
 	sessions: SessionView[];
+	archivedCount: number;
 	disk?: { id: string; zone: string; sizeGb: number };
 	/** Set while the data disk exists only as a snapshot. */
 	archive?: { snapshotId: string; sizeGb: number; at: number };

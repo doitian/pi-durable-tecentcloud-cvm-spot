@@ -87,8 +87,8 @@ ports of it (MIT):
 | Context files | pi's rules: `AGENTS.override.md`, `AGENTS.md` or `CLAUDE.md` from `~/.pi/agent`, then from each directory from `/` down to the session's working directory. Re-read at most every 30 s. |
 | Skills | `~/.pi/agent/skills/` and `<repo>/.pi/skills/`, discovered and listed the way pi does; `disable-model-invocation` hides one. |
 | Subagents | A `subagent` tool, as in pi's durable agent: it runs a task in a child conversation with the same tools and returns the answer. It survives a VM replacement. |
-| Compaction | Automatic, from pi-durable: background summaries near the context limit, plus one retry after a context overflow. **Compact** in a session's header runs it now, with optional instructions. |
-| New context | **New context** starts a fresh context from an optional handoff note; the history stays stored. |
+| Compaction | Automatic, from pi-durable: background summaries near the context limit, plus one retry after a context overflow. **Compact context** in a session's **⋯** menu runs it now, with optional instructions. |
+| New context | **New context** in the **⋯** menu starts a fresh context from an optional handoff note; the history stays stored. |
 | Retries, steering, follow-ups, abort, per-session model and thinking level, cost | From pi-durable. |
 | Not available | MCP/codemode, pi extensions and packages, prompt templates, `@file` mentions, `!` commands (use the web terminal), branching (fork/tree) in the UI. |
 
@@ -97,8 +97,8 @@ can create them itself if you ask a session to.
 
 ## Web terminal
 
-**Shell** in a session's header opens a terminal in that session's workspace. It runs in a tmux session named
-`pi-<first 8 characters of the session ID>`. **Shell** in the top bar opens a VM-wide one, tmux session `pi-shell`,
+**Open shell** in a session's **⋯** menu opens a terminal in that session's workspace. It runs in a tmux session named
+`pi-<first 8 characters of the session ID>`. **Menu → Open shell** in the top bar opens a VM-wide one, tmux session `pi-shell`,
 in `HOME`.
 - **Reattaching:** opening a shell runs `tmux new-session -A`, so it reattaches when the tmux session exists.
 - **Closing:** closing the dialog only detaches. The tmux session keeps running until the VM is replaced; a new VM
@@ -289,7 +289,11 @@ PI_HUB_URL=http://127.0.0.1:8787 PI_INSTANCE_ID=local PI_AGENT_TOKEN=<LOCAL_AGEN
     billed until the next start.
   - The VM is billed only while it runs; the spot price covers CPU and memory only.
   - Public traffic is billed per GB.
-- **Archiving** a session hides it and stops its run. Its files stay on the data disk.
+- **Archiving** a session (**⋯ → Archive**) stops its run and closes it; its files stay on the data disk.
+  **Archived sessions** (under the session list, or in the top menu) lists them for batch **Resume** or **Delete**.
+  - Resume reopens a session right away if a VM is online, otherwise on the next start.
+  - Delete removes the session for good: its transcript, its pi-durable state, its workspace (including uncommitted
+    changes) and its tmux session. With no VM online, the files are removed when the next VM connects.
 - After a zone migration, the log names the old disk and snapshot to delete.
 
 ## Caveats
@@ -301,9 +305,9 @@ PI_HUB_URL=http://127.0.0.1:8787 PI_INSTANCE_ID=local PI_AGENT_TOKEN=<LOCAL_AGEN
   - the default-VPC behaviour of `CreateDefaultVpc` on your account.
 - `@earendil-works/pi-durable` is experimental and its API changes without notice. It is pinned to `1.0.0`.
 - One VM serves all sessions.
-- Tencent disks can only grow. To get a smaller disk, use **Settings → Replace data disk**. It deletes the disk, its
-  snapshots, session state, workspaces and saved logins, and archives all sessions; the next start creates an empty
-  disk at the configured size.
+- Tencent disks can only grow. To get a smaller disk, use **Menu → Delete data disk** while no VM exists. It deletes the
+  disk, its snapshots, session state, workspaces and saved logins, and archives all sessions; the next start creates an
+  empty disk at the size set in Settings.
 - The agent can read every secret in `AGENT_ENV`, because it needs them to work. Scope tokens accordingly.
 - If the reclaim notice is missed (abrupt loss), side effects of the step in flight, such as `git push` or opening a
   PR, can happen again when the model retries. The system prompt asks it to check first.
