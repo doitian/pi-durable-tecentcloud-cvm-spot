@@ -139,8 +139,8 @@ How a type is chosen:
         "cvm:DescribeZoneInstanceConfigInfos", "cvm:DescribeImages",
         "cvm:CreateDisks", "cvm:DescribeDisks", "cvm:AttachDisks", "cvm:DetachDisks",
         "cvm:ModifyDiskAttributes", "cvm:CreateSnapshot", "cvm:DescribeSnapshots",
-        "vpc:DescribeSecurityGroups", "vpc:CreateSecurityGroupWithPolicies",
-        "vpc:CreateSecurityGroupPolicies", "vpc:CreateDefaultVpc",
+        "cvm:DescribeSecurityGroups", "cvm:CreateSecurityGroupWithPolicies",
+        "cvm:CreateSecurityGroupPolicies", "vpc:CreateDefaultVpc",
         "tag:*"
       ],
       "resource": ["*"]
@@ -149,7 +149,8 @@ How a type is chosen:
 }
 ```
 
-Cloud-disk (CBS) actions use the `cvm:` prefix in CAM, even though the API is `cbs.tencentcloudapi.com`.
+Cloud-disk (CBS) and security-group actions use the `cvm:` prefix in CAM, even though their APIs are served from
+`cbs.tencentcloudapi.com` and `vpc.tencentcloudapi.com`.
 
 If a call fails with `UnauthorizedOperation`, the control panel log names the missing action. Add it to the policy, or
 use the broader preset policies `QcloudCVMFullAccess`, `QcloudVPCFullAccess` and `QcloudTAGFullAccess`.
