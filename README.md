@@ -137,8 +137,8 @@ How a type is chosen:
       "action": [
         "cvm:RunInstances", "cvm:DescribeInstances", "cvm:TerminateInstances",
         "cvm:DescribeZoneInstanceConfigInfos", "cvm:DescribeImages",
-        "cbs:CreateDisks", "cbs:DescribeDisks", "cbs:AttachDisks", "cbs:DetachDisks",
-        "cbs:ModifyDiskAttributes", "cbs:CreateSnapshot", "cbs:DescribeSnapshots",
+        "cvm:CreateDisks", "cvm:DescribeDisks", "cvm:AttachDisks", "cvm:DetachDisks",
+        "cvm:ModifyDiskAttributes", "cvm:CreateSnapshot", "cvm:DescribeSnapshots",
         "vpc:DescribeSecurityGroups", "vpc:CreateSecurityGroupWithPolicies",
         "vpc:CreateSecurityGroupPolicies", "vpc:CreateDefaultVpc",
         "tag:*"
@@ -149,8 +149,10 @@ How a type is chosen:
 }
 ```
 
+Cloud-disk (CBS) actions use the `cvm:` prefix in CAM, even though the API is `cbs.tencentcloudapi.com`.
+
 If a call fails with `UnauthorizedOperation`, the control panel log names the missing action. Add it to the policy, or
-use the preset `QcloudCVMFullAccess` + `QcloudCBSFullAccess` + `QcloudVPCFullAccess` policies.
+use the broader preset policies `QcloudCVMFullAccess`, `QcloudVPCFullAccess` and `QcloudTAGFullAccess`.
 
 ### 2. Cloudflare: deploy on push (Workers Builds)
 
