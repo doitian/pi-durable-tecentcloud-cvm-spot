@@ -139,8 +139,9 @@ How a type is chosen:
         "cvm:DescribeZoneInstanceConfigInfos", "cvm:DescribeImages",
         "cvm:CreateDisks", "cvm:DescribeDisks", "cvm:AttachDisks", "cvm:DetachDisks",
         "cvm:ModifyDiskAttributes", "cvm:CreateSnapshot", "cvm:DescribeSnapshots",
-        "cvm:DescribeSecurityGroups", "cvm:CreateSecurityGroupWithPolicies",
-        "cvm:CreateSecurityGroupPolicies", "vpc:CreateDefaultVpc",
+        "cvm:DescribeSecurityGroups",
+        "cvm:CreateSecurityGroupWithPolicies", "vpc:CreateSecurityGroupWithPolicies",
+        "vpc:CreateSecurityGroupPolicies", "vpc:CreateDefaultVpc",
         "tag:*"
       ],
       "resource": ["*"]
