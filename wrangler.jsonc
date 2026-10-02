@@ -1,0 +1,53 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  // Must match the Worker's name in the Cloudflare dashboard when deploying with Workers Builds.
+  "name": "pi-durable-tecentcloud-cvm-spot",
+  "main": "worker/src/index.ts",
+  "compatibility_date": "2026-09-25",
+  // Runs before every `wrangler deploy` and `wrangler dev`: bundles the agent that new VMs download.
+  "build": {
+    "command": "npm run build",
+    "watch_dir": ["agent/src", "shared"]
+  },
+  "assets": {
+    "directory": "./worker/public",
+    "binding": "ASSETS"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "HUB", "class_name": "Hub" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Hub"] }],
+  // Watchdog only: the Hub schedules itself with Durable Object alarms (immediately on user actions, every 10-30 s
+  // while a VM exists or is starting, none while idle). This catches anything that slipped through.
+  "triggers": { "crons": ["*/15 * * * *"] },
+  "observability": { "enabled": true },
+  "vars": {
+    "CLOUD_MODE": "tencent",
+    // The URL agents connect back to. Empty: the origin the control panel was last used from.
+    "PUBLIC_URL": "",
+    "TENCENT_REGION": "ap-singapore",
+    "NAME_PREFIX": "pi-spot",
+    "DEFAULT_MODEL": "anthropic/claude-sonnet-5",
+
+    // Spot instance selection; also editable at runtime from the control panel.
+    "MIN_CPU": "2",
+    "MIN_MEMORY_GB": "4",
+    "MAX_HOURLY_PRICE": "",
+    "PREFERRED_CATEGORY": "general",
+    "ZONES": "",
+    "IDLE_MINUTES": "20",
+
+    "DATA_DISK_GB": "100",
+    "DATA_DISK_TYPE": "CLOUD_BSSD",
+    "SYSTEM_DISK_TYPE": "CLOUD_BSSD",
+    "SYSTEM_DISK_GB": "50",
+    "BANDWIDTH_MBPS": "100",
+    "NODE_MAJOR": "24",
+    "AGENT_SUDO": "true",
+    "ALLOW_ZONE_MIGRATION": "true",
+
+    // Optional: SSH key pair IDs and a CIDR allowed to reach port 22, for debugging.
+    "KEY_IDS": "",
+    "SSH_CIDR": ""
+  }
+}

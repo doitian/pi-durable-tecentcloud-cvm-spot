@@ -1,0 +1,15 @@
+{
+  "name": "@pi-spot/worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261002.1",
+    "tencentcloud-sdk-nodejs-common": "^4.1.220",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.3"
+  }
+}
