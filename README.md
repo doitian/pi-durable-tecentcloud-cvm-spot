@@ -139,10 +139,11 @@ How a type is chosen:
         "cvm:DescribeZoneInstanceConfigInfos", "cvm:DescribeImages",
         "cvm:CreateDisks", "cvm:DescribeDisks", "cvm:AttachDisks", "cvm:DetachDisks",
         "cvm:ModifyDiskAttributes", "cvm:CreateSnapshot", "cvm:DescribeSnapshots",
-        "cvm:DescribeSecurityGroup*", "cvm:CreateSecurityGroup*",
+        "cvm:DescribeSecurityGroup*", "cvm:CreateSecurityGroup", "cvm:CreateSecurityGroup*",
         "vpc:CreateSecurityGroupWithPolicies", "vpc:CreateSecurityGroupPolicies",
         "vpc:CreateDefaultVpc",
-        "tag:*"
+        "tag:*",
+        "finance:trade"
       ],
       "resource": ["*"]
     }
@@ -152,7 +153,8 @@ How a type is chosen:
 
 Cloud-disk (CBS) and security-group actions are authorized under the `cvm:` prefix, even though their APIs are
 served from `cbs.tencentcloudapi.com` and `vpc.tencentcloudapi.com`. Security groups are also checked under their
-legacy names (`CreateSecurityGroupWithPolicies` is checked as `cvm:CreateSecurityGroup`), hence the wildcards.
+legacy names (`CreateSecurityGroupWithPolicies` is checked as `cvm:CreateSecurityGroup`). `finance:trade` lets the
+key pay for what it launches; without it `RunInstances` fails with "you have no payment rights".
 
 If a call fails with `UnauthorizedOperation`, the control panel log names the missing action. Add it to the policy, or
 use the broader preset policies `QcloudCVMFullAccess`, `QcloudVPCFullAccess` and `QcloudTAGFullAccess`.
