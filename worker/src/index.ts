@@ -19,11 +19,16 @@ function timingSafeEqual(a: string, b: string): boolean {
 	return crypto.subtle.timingSafeEqual(left, right);
 }
 
-function authorized(request: Request, url: URL, env: Env): boolean {
-	if (!env.ADMIN_TOKEN) return false;
+/** Why the request may not use the API, or undefined when it carries the admin token. */
+function adminDenial(request: Request, url: URL, env: Env): string | undefined {
+	// Values pasted into the dashboard easily pick up a trailing newline.
+	const expected = env.ADMIN_TOKEN?.trim();
+	if (!expected) {
+		return "This Worker has no ADMIN_TOKEN secret yet. Add it under Settings > Variables and Secrets, then deploy.";
+	}
 	const header = request.headers.get("Authorization") ?? "";
 	const token = header.startsWith("Bearer ") ? header.slice(7) : (url.searchParams.get("token") ?? "");
-	return timingSafeEqual(token, env.ADMIN_TOKEN);
+	return timingSafeEqual(token.trim(), expected) ? undefined : "Wrong admin token.";
 }
 
 async function api(request: Request, url: URL, env: Env): Promise<Response> {
@@ -64,7 +69,8 @@ export default {
 		// The Hub checks the per-instance token itself.
 		if (url.pathname === "/api/agent/ws") return hub(env).fetch(request);
 		if (url.pathname.startsWith("/api/")) {
-			if (!authorized(request, url, env)) return json({ error: "unauthorized" }, 401);
+			const denial = adminDenial(request, url, env);
+			if (denial) return json({ error: denial }, 401);
 			if (url.pathname === "/api/ui/ws") return hub(env).fetch(request);
 			try {
 				return await api(request, url, env);

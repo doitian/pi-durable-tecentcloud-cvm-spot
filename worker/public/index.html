@@ -124,7 +124,8 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 <dialog id="loginDialog">
   <form method="dialog" id="loginForm">
     <h2>Admin token</h2>
-    <div class="form"><label class="wide">The ADMIN_TOKEN secret of this Worker<input id="tokenInput" type="password" autocomplete="current-password" required></label></div>
+    <div class="msg error" id="loginError"></div>
+    <div class="form"><label class="wide">The value of this Worker's ADMIN_TOKEN secret<input id="tokenInput" type="password" autocomplete="current-password" required></label></div>
     <div class="actions"><button class="primary" value="ok">Continue</button></div>
   </form>
 </dialog>
@@ -204,8 +205,8 @@ async function api(path, options = {}) {
     ...options,
     headers: { "content-type": "application/json", authorization: `Bearer ${token}`, ...(options.headers || {}) },
   });
-  if (response.status === 401) { askToken(); throw new Error("unauthorized"); }
   const body = await response.json().catch(() => ({}));
+  if (response.status === 401) { askToken(body.error); throw new Error(body.error || "unauthorized"); }
   if (!response.ok) throw new Error(body.error || response.statusText);
   return body;
 }
@@ -216,8 +217,12 @@ function showError(message) {
   banner.style.display = message ? "block" : "none";
 }
 
-function askToken() {
-  if (!$("#loginDialog").open) $("#loginDialog").showModal();
+function askToken(reason) {
+  $("#loginError").textContent = reason || "";
+  if (!$("#loginDialog").open) {
+    $("#tokenInput").value = "";
+    $("#loginDialog").showModal();
+  }
 }
 
 $("#loginForm").addEventListener("submit", () => {
@@ -238,8 +243,11 @@ function connect() {
   ws.onclose = () => {
     if (socket !== ws) return;
     socket = null;
-    setTimeout(connect, backoff);
-    backoff = Math.min(backoff * 2, 15000);
+    // A rejected token closes the socket during the handshake; ask instead of retrying forever.
+    api("/state").then(
+      () => { setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 15000); },
+      (error) => { if (error.message === "unauthorized" || $("#loginDialog").open) return; setTimeout(connect, backoff); },
+    );
   };
 }
 
