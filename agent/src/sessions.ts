@@ -19,6 +19,7 @@ import type { PendingInput, SessionReport, SessionSpec } from "../../shared/prot
 import type { AgentConfig } from "./config.ts";
 import { SpotAgent } from "./extension.ts";
 import { prepareWorkspace } from "./git.ts";
+import { withSessionId } from "./models.ts";
 
 const ENTRY_CHUNK_BYTES = 600_000;
 
@@ -114,7 +115,7 @@ class Session {
 		const harness = await Harness.open(
 			await openNodeSqliteStorage(join(dir, "session.sqlite")),
 			{
-				models: this.models,
+				models: withSessionId(this.models, this.spec.id),
 				registry,
 				settings,
 				env: (target) => new NodeExecutionEnv({ cwd: target.cwd ?? cwd, shellEnv: process.env }),
