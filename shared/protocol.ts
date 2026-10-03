@@ -1,7 +1,7 @@
 // Messages exchanged between the Hub (Cloudflare Durable Object), the agent on the CVM, and the browser UI.
 // Pi-durable agent events and entries travel as opaque JSON; only the browser interprets them.
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 export interface ModelRef {
 	provider: string;
@@ -9,6 +9,9 @@ export interface ModelRef {
 }
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/** "auto" runs every tool call; "ask" holds calls that can change something until the user approves them. */
+export type ApprovalMode = "auto" | "ask";
 
 export interface SessionSpec {
 	id: string;
@@ -18,6 +21,21 @@ export interface SessionSpec {
 	model: ModelRef;
 	thinkingLevel?: ThinkingLevel;
 	instructions?: string;
+	/** Absent means "auto". */
+	approvalMode?: ApprovalMode;
+}
+
+export interface McpServerStatus {
+	name: string;
+	state: "connecting" | "connected" | "failed";
+	tools: number;
+	error?: string;
+}
+
+/** pi's credentials (`{ [providerId]: Credential }`) and the installation ID login flows send; kept by the Hub. */
+export interface SavedCredentials {
+	data: Record<string, unknown>;
+	deviceId: string;
 }
 
 export interface PendingInput {
@@ -33,6 +51,9 @@ export interface SessionReport {
 	ready: boolean;
 	error?: string;
 	costUsd?: number;
+	/** Tool calls held for the user's approval. */
+	awaitingApproval?: number;
+	mcp?: McpServerStatus[];
 }
 
 /** One model provider as the agent sees it; never carries secrets. */
@@ -43,7 +64,7 @@ export interface AuthProviderInfo {
 	apiKeyLogin: boolean;
 	/** Set when requests to this provider would be authenticated, e.g. `{ type: "oauth", source: "OAuth" }`. */
 	configured?: { type: "api_key" | "oauth"; source?: string };
-	/** Credential saved in auth.json on the data disk (the only kind Log out removes). */
+	/** Credential saved by the control panel (the only kind Log out removes). */
 	stored?: "api_key" | "oauth";
 }
 
@@ -90,6 +111,12 @@ export type AgentToHub =
 	| { t: "stopped"; reason: string }
 	| { t: "log"; level: "info" | "warn" | "error"; message: string }
 	| ({ t: "auth" } & AuthReport)
+	/** The whole credential set after every change; resent after a reconnect until the Hub confirms `revision`. */
+	| { t: "credentials"; revision: number; credentials: SavedCredentials }
+	/** A tool call waits for the user; sent again after a reconnect or from the next VM while it still waits. */
+	| { t: "approval_request"; sessionId: string; approvalId: string; toolName: string; preview: string }
+	/** The call received its answer and recorded it; the Hub forgets the request. */
+	| { t: "approval_settled"; sessionId: string; approvalId: string }
 	| LoginMessage
 	/** Terminal output, base64 because it is raw PTY bytes. */
 	| { t: "term_output"; termId: string; data: string }
@@ -106,7 +133,13 @@ export type HubToAgent =
 			aborts: string[];
 			/** Deleted sessions whose files are still on the data disk. */
 			purges: string[];
+			/** Null until an agent first saved credentials. */
+			credentials: SavedCredentials | null;
 	  }
+	| { t: "credentials_saved"; revision: number }
+	| { t: "approval_reply"; sessionId: string; approvalId: string; approve: boolean; reason?: string }
+	/** Reconnect the session's MCP servers after their configuration changed. */
+	| { t: "mcp_reload"; sessionId: string }
 	| { t: "session"; session: SessionSpec }
 	| { t: "input"; input: PendingInput }
 	| { t: "abort"; sessionId: string }
@@ -145,19 +178,32 @@ export interface InstanceView {
 	reclaimAt?: string;
 }
 
+export interface ApprovalView {
+	id: string;
+	toolName: string;
+	/** The call's arguments as JSON, truncated. */
+	preview: string;
+	requestedAt: number;
+	/** Set once the user answered while no VM could take the answer yet. */
+	decision?: "approve" | "deny";
+}
+
 export interface SessionView {
 	id: string;
 	title: string;
 	repoUrl?: string;
 	model: ModelRef;
 	thinkingLevel?: ThinkingLevel;
+	approvalMode: ApprovalMode;
 	createdAt: number;
 	lastActivityAt: number;
 	ready: boolean;
 	busy: boolean;
 	pendingInputs: number;
+	approvals: ApprovalView[];
 	error?: string;
 	costUsd?: number;
+	mcp?: McpServerStatus[];
 }
 
 export interface ArchivedSessionView {

@@ -18,8 +18,10 @@ import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import type { PendingInput, SessionReport, SessionSpec } from "../../shared/protocol.ts";
+import { Approvals, type Decision } from "./approvals.ts";
 import type { AgentConfig } from "./config.ts";
 import { prepareWorkspace } from "./git.ts";
+import { McpServers } from "./mcp.ts";
 import { withSessionId } from "./models.ts";
 import { createPiPrompt } from "./pi-prompt.ts";
 import { Subagent } from "./subagent.ts";
@@ -30,15 +32,9 @@ export interface SessionSink {
 	events(sessionId: string, events: readonly unknown[]): void;
 	status(report: SessionReport): void;
 	ack(sessionId: string, requestId: string, error?: string): void;
+	approvalRequest(sessionId: string, approvalId: string, toolName: string, preview: string): void;
+	approvalSettled(sessionId: string, approvalId: string): void;
 	log(level: "info" | "warn" | "error", message: string): void;
-}
-
-function createCodingRegistry(config: AgentConfig): Registry {
-	const registry = createRegistry();
-	registry.install(CodingTools);
-	registry.install(Subagent);
-	registry.install(createPiPrompt(config.agentDir, config.workDir));
-	return registry;
 }
 
 const settings: HarnessSettings = {
@@ -55,9 +51,15 @@ function totalCost(usage: UsageState | undefined): number {
 	return total;
 }
 
-/** One pi-durable Harness over `<sessions>/<id>/session.sqlite`, working in `<work>/<id>`. */
+/**
+ * One pi-durable Harness over `<sessions>/<id>/session.sqlite`, working in `<work>/<id>`, with its own registry: pi's
+ * tools and prompt, the approval gate and the MCP servers configured for its workspace.
+ */
 class Session {
 	private harness: Harness | undefined;
+	private readonly registry: Registry = createRegistry();
+	private readonly approvals: Approvals;
+	private readonly mcp: McpServers;
 	private root: Conversation | undefined;
 	private stream: AgentEventStream | undefined;
 	private opening: Promise<void> | undefined;
@@ -68,17 +70,34 @@ class Session {
 	private compactions = new Set<string>();
 	private costUsd = 0;
 	private error: string | undefined;
-	private lastBusy: boolean | undefined;
+	private lastReport: string | undefined;
 	private closed = false;
 
 	constructor(
 		public spec: SessionSpec,
 		private readonly config: AgentConfig,
 		private readonly models: MutableModels,
-		private readonly registry: Registry,
 		private readonly sink: SessionSink,
 		private readonly context: Context,
-	) {}
+	) {
+		const id = spec.id;
+		this.approvals = new Approvals(id, () => this.spec.approvalMode ?? "auto", {
+			request: (approvalId, toolName, preview) => sink.approvalRequest(id, approvalId, toolName, preview),
+			settled: (approvalId) => sink.approvalSettled(id, approvalId),
+			changed: () => this.publishStatus(),
+		});
+		this.mcp = new McpServers(
+			this.cwd,
+			config.agentDir,
+			(extension) => this.registry.install(extension),
+			() => this.publishStatus(),
+			(level, message) => sink.log(level, `session ${id}: ${message}`),
+		);
+		this.registry.install(CodingTools);
+		this.registry.install(Subagent);
+		this.registry.install(createPiPrompt(config.agentDir, config.workDir));
+		this.registry.install(this.approvals.extension);
+	}
 
 	get cwd(): string {
 		return join(this.config.workDir, this.spec.id);
@@ -89,16 +108,19 @@ class Session {
 	}
 
 	get busy(): boolean {
-		return this.running || this.inbox > 0 || this.compactions.size > 0 || this.queued.length > 0;
+		return this.running || this.inbox > 0 || this.compactions.size > 0 || this.queued.length > 0 || this.approvals.count > 0;
 	}
 
 	report(): SessionReport {
+		const mcp = this.mcp.status();
 		return {
 			sessionId: this.spec.id,
 			ready: this.ready,
 			busy: this.busy,
 			...(this.error === undefined ? {} : { error: this.error }),
 			costUsd: this.costUsd,
+			...(this.approvals.count > 0 ? { awaitingApproval: this.approvals.count } : {}),
+			...(mcp.length > 0 ? { mcp } : {}),
 		};
 	}
 
@@ -117,6 +139,8 @@ class Session {
 
 	private async doOpen(): Promise<void> {
 		await prepareWorkspace(this.cwd, this.spec.repoUrl, this.spec.branch);
+		// Before resuming, so a run interrupted mid-call finds the MCP tool it called.
+		await this.mcp.start();
 		const dir = join(this.config.sessionsDir, this.spec.id);
 		await mkdir(dir, { recursive: true });
 		const cwd = this.cwd;
@@ -241,11 +265,25 @@ class Session {
 		}
 	}
 
+	/** Reports when something the Hub acts on changed. */
 	private publishStatus(force = false): void {
-		const busy = this.busy;
-		if (!force && busy === this.lastBusy) return;
-		this.lastBusy = busy;
-		this.sink.status(this.report());
+		const report = this.report();
+		const key = JSON.stringify([report.busy, report.ready, report.awaitingApproval, report.mcp]);
+		if (!force && key === this.lastReport) return;
+		this.lastReport = key;
+		this.sink.status(report);
+	}
+
+	reply(approvalId: string, decision: Decision): void {
+		this.approvals.reply(approvalId, decision);
+	}
+
+	resendApprovals(): void {
+		this.approvals.resend();
+	}
+
+	async reloadMcp(): Promise<void> {
+		await this.mcp.start();
 	}
 
 	async submit(input: PendingInput): Promise<void> {
@@ -288,25 +326,24 @@ class Session {
 	async close(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
+		this.approvals.freeze();
 		await this.opening?.catch(() => undefined);
 		await this.attaching;
 		await this.stream?.stop().catch(() => undefined);
 		await this.harness?.close(this.context);
+		await this.mcp.close();
 	}
 }
 
 export class SessionManager {
 	private readonly sessions = new Map<string, Session>();
-	private readonly registry: Registry;
 
 	constructor(
 		private readonly config: AgentConfig,
 		private readonly models: MutableModels,
 		private readonly sink: SessionSink,
 		private readonly context: Context,
-	) {
-		this.registry = createCodingRegistry(config);
-	}
+	) {}
 
 	get all(): Session[] {
 		return [...this.sessions.values()];
@@ -323,7 +360,7 @@ export class SessionManager {
 	upsert(spec: SessionSpec, resync = false): void {
 		const existing = this.sessions.get(spec.id);
 		if (!existing) {
-			const session = new Session(spec, this.config, this.models, this.registry, this.sink, this.context);
+			const session = new Session(spec, this.config, this.models, this.sink, this.context);
 			this.sessions.set(spec.id, session);
 			void session.open();
 			return;
@@ -373,6 +410,19 @@ export class SessionManager {
 
 	async resync(sessionId: string): Promise<void> {
 		await this.sessions.get(sessionId)?.attachStream();
+	}
+
+	reply(sessionId: string, approvalId: string, decision: Decision): void {
+		this.sessions.get(sessionId)?.reply(approvalId, decision);
+	}
+
+	/** After a reconnect: asks again for every call still waiting, in case the Hub lost track. */
+	resendApprovals(): void {
+		for (const session of this.all) session.resendApprovals();
+	}
+
+	async reloadMcp(sessionId: string): Promise<void> {
+		await this.sessions.get(sessionId)?.reloadMcp();
 	}
 
 	reports(): SessionReport[] {

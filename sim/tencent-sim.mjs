@@ -65,6 +65,9 @@ function startAgent(instance) {
 			PI_INSTANCE_ID: instance.id,
 			PI_AGENT_TOKEN: instance.token,
 			PI_DATA_DIR: DATA_DIR,
+			// HOME is on the data disk, as on a real VM (USERPROFILE is what Node reads on Windows).
+			HOME: join(DATA_DIR, "home"),
+			USERPROFILE: join(DATA_DIR, "home"),
 			PI_FAUX: "1",
 			PI_METADATA_URL: `http://127.0.0.1:${PORT}/meta/${instance.id}`,
 			PI_SPOT_POLL_MS: "1000",
@@ -171,7 +174,7 @@ const handlers = {
 		const id = newId("disk");
 		disks.set(id, { id, state: "CREATING", zone: params.Placement.Zone, size: params.DiskSize, deleteWithInstance: false });
 		log(`CreateDisks ${id} ${params.DiskSize}GB in ${params.Placement.Zone}${params.SnapshotId ? ` from ${params.SnapshotId}` : ""}`);
-		later(1000, () => (disks.get(id).state = "UNATTACHED"));
+		later(1000, () => disks.has(id) && (disks.get(id).state = "UNATTACHED"));
 		return { DiskIdSet: [id] };
 	},
 	DescribeDisks(params) {
@@ -236,7 +239,7 @@ const handlers = {
 	CreateSnapshot(params) {
 		const id = newId("snap");
 		snapshots.set(id, { id, state: "CREATING", diskId: params.DiskId });
-		later(3000, () => (snapshots.get(id).state = "NORMAL"));
+		later(3000, () => snapshots.has(id) && (snapshots.get(id).state = "NORMAL"));
 		return { SnapshotId: id };
 	},
 	DescribeSnapshots(params) {

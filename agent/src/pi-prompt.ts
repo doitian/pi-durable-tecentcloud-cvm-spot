@@ -1,7 +1,9 @@
 // pi's system prompt on pi-durable, ported from pi's coding agent (MIT): core/system-prompt.ts, the tool prompt
-// contributions in core/tools/*.ts, context files from core/resource-loader.ts, skills from core/skills.ts, and the
-// glue in experimental/durable/prompt.ts. None of these are exported by the published package.
+// contributions in core/tools/*.ts, context files from core/resource-loader.ts, skills from core/skills.ts and
+// core/package-manager.ts, and the glue in experimental/durable/prompt.ts. None of these are exported by the
+// published package.
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { defineExtension, type PromptInput, section } from "@earendil-works/pi-durable";
 import { parse as parseYaml } from "yaml";
@@ -111,9 +113,10 @@ function skillFromFile(filePath: string): Skill | undefined {
 
 /**
  * pi's discovery: a directory holding SKILL.md is one skill; otherwise its subdirectories are searched (skipping
- * dot directories and node_modules), and top-level .md files with a description are skills too.
+ * dot directories and node_modules). Loose .md files with a description are skills too: at the top level of a pi
+ * skills directory, below the top level of an Agent Skills (`.agents/skills`) one.
  */
-function skillsIn(dir: string, topLevel: boolean): Skill[] {
+function skillsIn(dir: string, mode: "pi" | "agents", root = dir): Skill[] {
 	if (!existsSync(dir)) return [];
 	let entries: import("node:fs").Dirent[];
 	try {
@@ -141,8 +144,8 @@ function skillsIn(dir: string, topLevel: boolean): Skill[] {
 				continue;
 			}
 		}
-		if (isDirectory) skills.push(...skillsIn(path, false));
-		else if (isFile && topLevel && entry.name.endsWith(".md")) {
+		if (isDirectory) skills.push(...skillsIn(path, mode, root));
+		else if (isFile && entry.name.endsWith(".md") && (mode === "pi") === (dir === root)) {
 			const skill = skillFromFile(path);
 			if (skill) skills.push(skill);
 		}
@@ -150,11 +153,42 @@ function skillsIn(dir: string, topLevel: boolean): Skill[] {
 	return skills;
 }
 
-/** User skills (`<agentDir>/skills`) win name collisions over project skills (`<cwd>/.pi/skills`), as in pi. */
-export function loadSkills(cwd: string, agentDir: string): Skill[] {
+/** `.agents/skills` in `cwd` and each parent, stopping at the repository root when there is one. */
+function agentsSkillDirs(cwd: string): string[] {
+	const start = resolve(cwd);
+	let repoRoot: string | undefined;
+	for (let dir = start; !repoRoot; ) {
+		if (existsSync(join(dir, ".git"))) repoRoot = dir;
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	const dirs: string[] = [];
+	for (let dir = start; ; ) {
+		dirs.push(join(dir, ".agents", "skills"));
+		const parent = dirname(dir);
+		if (dir === repoRoot || parent === dir) return dirs;
+		dir = parent;
+	}
+}
+
+/**
+ * pi 1.0's order, in which the first skill of a name wins: the project's `.pi/skills`, its `.agents/skills` from `cwd`
+ * up to the repository root, then the user's `<agentDir>/skills` and `~/.agents/skills`.
+ */
+export function loadSkills(cwd: string, agentDir: string, home = homedir()): Skill[] {
+	const userAgentsDir = resolve(home, ".agents", "skills");
+	const sources: Skill[] = [
+		...skillsIn(resolve(cwd, ".pi", "skills"), "pi"),
+		...agentsSkillDirs(cwd)
+			.filter((dir) => dir !== userAgentsDir)
+			.flatMap((dir) => skillsIn(dir, "agents")),
+		...skillsIn(join(resolve(agentDir), "skills"), "pi"),
+		...skillsIn(userAgentsDir, "agents"),
+	];
 	const byName = new Map<string, Skill>();
 	const realPaths = new Set<string>();
-	for (const skill of [...skillsIn(join(resolve(agentDir), "skills"), true), ...skillsIn(resolve(cwd, ".pi", "skills"), true)]) {
+	for (const skill of sources) {
 		let real = skill.filePath;
 		try {
 			real = realpathSync(skill.filePath);

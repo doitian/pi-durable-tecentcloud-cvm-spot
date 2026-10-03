@@ -10,7 +10,7 @@ interface ActiveLogin {
 
 /**
  * Runs pi-ai login flows on behalf of the control panel: events and prompts go to the browser, answers come back.
- * Credentials end up in the store, i.e. auth.json on the data disk.
+ * Credentials end up in the store, which the Hub keeps.
  */
 export class LoginManager {
 	private readonly active = new Map<string, ActiveLogin>();

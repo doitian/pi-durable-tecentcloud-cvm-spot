@@ -41,16 +41,43 @@ describe("loadContextFiles", () => {
 });
 
 describe("loadSkills", () => {
-	it("finds SKILL.md directories and described top-level files; user skills win name collisions", () => {
-		write(join(agentDir, "skills", "deploy", "SKILL.md"), "---\nname: deploy\ndescription: user deploy\n---\nbody");
+	const home = () => join(root, "home");
+	const frontmatter = (name: string, description: string) => `---\nname: ${name}\ndescription: ${description}\n---\n`;
+	const byName = (cwd: string) => Object.fromEntries(loadSkills(cwd, agentDir, home()).map((skill) => [skill.name, skill.description]));
+
+	// Keeps the upward search inside the temporary directory, away from the real home's ~/.agents/skills.
+	beforeEach(() => mkdirSync(join(root, ".git")));
+
+	it("finds SKILL.md directories and described top-level files; project skills win name collisions", () => {
+		write(join(agentDir, "skills", "deploy", "SKILL.md"), `${frontmatter("deploy", "user deploy")}body`);
 		write(join(agentDir, "skills", "nested", "review", "SKILL.md"), "---\ndescription: Review code\n---\n");
-		write(join(agentDir, "skills", "notes.md"), "---\nname: notes\ndescription: Take notes\n---\n");
+		write(join(agentDir, "skills", "notes.md"), frontmatter("notes", "Take notes"));
 		write(join(agentDir, "skills", "no-description", "SKILL.md"), "---\nname: x\n---\n");
-		write(join(repo, ".pi", "skills", "deploy", "SKILL.md"), "---\nname: deploy\ndescription: project deploy\n---\n");
-		write(join(repo, ".pi", "skills", "lint", "SKILL.md"), "---\nname: lint\ndescription: Lint the repo\n---\n");
-		const skills = loadSkills(repo, agentDir);
-		const byName = Object.fromEntries(skills.map((skill) => [skill.name, skill.description]));
-		expect(byName).toEqual({ deploy: "user deploy", review: "Review code", notes: "Take notes", lint: "Lint the repo" });
+		write(join(repo, ".pi", "skills", "deploy", "SKILL.md"), frontmatter("deploy", "project deploy"));
+		write(join(repo, ".pi", "skills", "lint", "SKILL.md"), frontmatter("lint", "Lint the repo"));
+		expect(byName(repo)).toEqual({ deploy: "project deploy", lint: "Lint the repo", review: "Review code", notes: "Take notes" });
+	});
+
+	it("reads .agents/skills from the working directory up to the repository root, and ~/.agents/skills", () => {
+		mkdirSync(join(repo, ".git"));
+		write(join(repo, "pkg", ".agents", "skills", "pkg-skill", "SKILL.md"), frontmatter("pkg-skill", "from pkg"));
+		write(join(repo, ".agents", "skills", "repo-skill", "SKILL.md"), frontmatter("repo-skill", "from the repo root"));
+		write(join(repo, ".agents", "skills", "loose.md"), frontmatter("loose", "top-level files are not skills here"));
+		write(join(repo, ".agents", "skills", "group", "grouped.md"), frontmatter("grouped", "nested loose file"));
+		write(join(root, "work", ".agents", "skills", "outside", "SKILL.md"), frontmatter("outside", "above the repository"));
+		write(join(home(), ".agents", "skills", "mine", "SKILL.md"), frontmatter("mine", "user agent skill"));
+		write(join(home(), ".agents", "skills", "repo-skill", "SKILL.md"), frontmatter("repo-skill", "loses to the project"));
+		expect(byName(join(repo, "pkg"))).toEqual({
+			"pkg-skill": "from pkg",
+			"repo-skill": "from the repo root",
+			grouped: "nested loose file",
+			mine: "user agent skill",
+		});
+	});
+
+	it("walks past a workspace that is not a repository, up to the enclosing one", () => {
+		write(join(root, "work", ".agents", "skills", "outside", "SKILL.md"), frontmatter("outside", "above the workspace"));
+		expect(byName(repo)).toEqual({ outside: "above the workspace" });
 	});
 });
 

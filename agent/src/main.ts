@@ -8,7 +8,7 @@ import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { type HubToAgent, PROTOCOL_VERSION } from "../../shared/protocol.ts";
 import { AGENT_VERSION, loadConfig } from "./config.ts";
-import { deviceId, FileCredentialStore } from "./credentials.ts";
+import { type HubCredentialStore, openCredentials } from "./credentials.ts";
 import { configureGit, pushWipSnapshot } from "./git.ts";
 import { HubClient } from "./hub-client.ts";
 import { LoginManager } from "./login.ts";
@@ -25,7 +25,7 @@ registerBunOAuthFlows();
 // Seconds before the reclaim time at which the agent checkpoints and stops.
 const RECLAIM_STOP_LEAD_MS = 60_000;
 
-const credentials = new FileCredentialStore(join(config.agentDir, "auth.json"));
+let credentials: HubCredentialStore | undefined;
 let manager: SessionManager | undefined;
 let logins: LoginManager | undefined;
 const terminals = new Terminals({
@@ -89,10 +89,20 @@ function createModels(store: CredentialStore): MutableModels {
 					fauxText("Done. The command ran on the agent machine."),
 				]);
 			}
-			const text = typeof last.content === "string" ? last.content : JSON.stringify(last.content ?? "");
-			const call = text.includes("delegate:")
-				? fauxToolCall("subagent", { task: "child task: run the command" })
-				: fauxToolCall("bash", { command: "sleep 8; echo hello from $(hostname); ls -la | head -5" });
+			const content = last.content;
+			const text =
+				typeof content === "string"
+					? content
+					: Array.isArray(content)
+						? content.map((block: { text?: unknown }) => (typeof block.text === "string" ? block.text : "")).join("")
+						: "";
+			// "mcp: <tool> <json arguments>" calls that tool.
+			const mcp = /mcp:\s*(\S+)\s*(\{.*\})?/s.exec(text);
+			const call = mcp
+				? fauxToolCall(mcp[1]!, mcp[2] ? (JSON.parse(mcp[2]) as Parameters<typeof fauxToolCall>[1]) : {})
+				: text.includes("delegate:")
+					? fauxToolCall("subagent", { task: "child task: run the command" })
+					: fauxToolCall("bash", { command: "sleep 8; echo hello from $(hostname); ls -la | head -5" });
 			return fauxAssistantMessage(call, { stopReason: "toolUse" });
 		};
 		faux.setResponses(Array.from({ length: 10_000 }, () => step));
@@ -108,12 +118,16 @@ async function handle(message: HubToAgent): Promise<void> {
 			if (!manager) {
 				Object.assign(process.env, message.env);
 				await configureGit().catch((error) => log("warn", `git setup: ${error}`));
-				const models = createModels(credentials);
+				const store = await openCredentials(message.credentials, config.agentDir, (saved, revision) =>
+					hub.send({ t: "credentials", revision, credentials: saved }),
+				);
+				credentials = store;
+				const models = createModels(store);
 				logins = new LoginManager(
 					models,
-					credentials,
+					store,
 					(login) => void hub.send(login),
-					() => deviceId(config.agentDir),
+					async () => store.deviceId,
 					() => void publishAuth(),
 				);
 				manager = new SessionManager(
@@ -124,10 +138,17 @@ async function handle(message: HubToAgent): Promise<void> {
 						status: (session) => void hub.send({ t: "status", session }),
 						ack: (sessionId, requestId, error) =>
 							void hub.send({ t: "ack", sessionId, requestId, ...(error ? { error } : {}) }),
+						approvalRequest: (sessionId, approvalId, toolName, preview) =>
+							void hub.send({ t: "approval_request", sessionId, approvalId, toolName, preview }),
+						approvalSettled: (sessionId, approvalId) => void hub.send({ t: "approval_settled", sessionId, approvalId }),
 						log,
 					},
 					context,
 				);
+			} else {
+				// A reconnect: whatever the Hub missed meanwhile.
+				credentials?.resend();
+				manager.resendApprovals();
 			}
 			manager.sync(message.sessions);
 			for (const input of message.inputs) void manager.submit(input);
@@ -198,6 +219,19 @@ async function handle(message: HubToAgent): Promise<void> {
 		case "logout":
 			await logins?.logout(message.provider);
 			log("info", `logged out of ${message.provider}`);
+			return;
+		case "credentials_saved":
+			credentials?.saved(message.revision);
+			return;
+		case "approval_reply":
+			manager?.reply(message.sessionId, message.approvalId, {
+				approve: message.approve,
+				...(message.reason ? { reason: message.reason } : {}),
+			});
+			return;
+		case "mcp_reload":
+			await manager?.reloadMcp(message.sessionId);
+			log("info", `MCP servers reloaded for session ${message.sessionId}`);
 			return;
 		case "pong":
 			return;

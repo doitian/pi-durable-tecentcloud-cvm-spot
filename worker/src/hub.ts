@@ -1,13 +1,17 @@
 import { DurableObject } from "cloudflare:workers";
 import type {
 	AgentToHub,
+	ApprovalMode,
+	ApprovalView,
 	ArchivedSessionView,
 	AuthReport,
 	HubToAgent,
 	HubToTerm,
 	HubToUi,
 	InstancePhase,
+	McpServerStatus,
 	PanelState,
+	SavedCredentials,
 	SessionReport,
 	SessionSpec,
 	SessionView,
@@ -54,6 +58,8 @@ const DEAD_STATES = new Set(["LAUNCH_FAILED", "SHUTDOWN", "TERMINATING", "STOPPE
 const MAX_ENTRY_BYTES = 1_500_000;
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const TRANSCRIPT_LIMIT = 400;
+/** A decision the session's run never picked up while the session sat idle this long is dropped. */
+const STALE_DECISION_MS = 10 * 60_000;
 
 export interface Settings {
 	minCpu: number;
@@ -133,6 +139,19 @@ type SessionRow = {
 	error: string | null;
 	cost: number;
 	pending_abort: number;
+	awaiting: number;
+	mcp: string | null;
+};
+
+type ApprovalRow = {
+	id: string;
+	session_id: string;
+	tool_name: string;
+	preview: string;
+	requested_at: number;
+	decision: "approve" | "deny" | null;
+	reason: string | null;
+	decided_at: number | null;
 };
 
 type SocketAttachment =
@@ -151,6 +170,7 @@ export interface CreateSessionInput {
 	branch?: string;
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
+	approvalMode?: ApprovalMode;
 	instructions?: string;
 	prompt?: string;
 }
@@ -159,6 +179,12 @@ function parseModel(value: string): { provider: string; modelId: string } {
 	const slash = value.indexOf("/");
 	if (slash <= 0) throw new Error(`Model must look like provider/modelId, got "${value}"`);
 	return { provider: value.slice(0, slash), modelId: value.slice(slash + 1) };
+}
+
+function parseApprovalMode(value: string | undefined): ApprovalMode {
+	if (value === undefined || value === "" || value === "auto") return "auto";
+	if (value === "ask") return "ask";
+	throw new Error(`Unknown approval mode "${value}"`);
 }
 
 function parseThinkingLevel(value: string | null | undefined): ThinkingLevel | null {
@@ -199,7 +225,8 @@ export class Hub extends DurableObject<Env> {
 			CREATE TABLE IF NOT EXISTS sessions (
 				id TEXT PRIMARY KEY, spec TEXT NOT NULL, created_at INTEGER NOT NULL, last_activity_at INTEGER NOT NULL,
 				ready INTEGER NOT NULL DEFAULT 0, busy INTEGER NOT NULL DEFAULT 0, error TEXT, cost REAL NOT NULL DEFAULT 0,
-				pending_abort INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0);
+				pending_abort INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0,
+				awaiting INTEGER NOT NULL DEFAULT 0, mcp TEXT);
 			CREATE TABLE IF NOT EXISTS inputs (
 				request_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, when_busy TEXT NOT NULL,
 				created_at INTEGER NOT NULL, acked_at INTEGER, error TEXT);
@@ -208,7 +235,15 @@ export class Hub extends DurableObject<Env> {
 			CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, level TEXT NOT NULL,
 				message TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS purges (session_id TEXT PRIMARY KEY, requested_at INTEGER NOT NULL);
+			CREATE TABLE IF NOT EXISTS approvals (
+				id TEXT PRIMARY KEY, session_id TEXT NOT NULL, tool_name TEXT NOT NULL, preview TEXT NOT NULL,
+				requested_at INTEGER NOT NULL, decision TEXT, reason TEXT, decided_at INTEGER);
 		`);
+		const columns = new Set(
+			this.sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('sessions')").toArray().map((column) => column.name),
+		);
+		if (!columns.has("awaiting")) this.sql.exec("ALTER TABLE sessions ADD COLUMN awaiting INTEGER NOT NULL DEFAULT 0");
+		if (!columns.has("mcp")) this.sql.exec("ALTER TABLE sessions ADD COLUMN mcp TEXT");
 		ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping"}', '{"t":"pong"}'));
 	}
 
@@ -317,11 +352,13 @@ export class Hub extends DurableObject<Env> {
 			}));
 	}
 
+	/** A session whose run only waits for the user's approval is no reason to keep, or start, a VM. */
 	private hasDemand(now: number, cloud: CloudState): boolean {
 		if ((cloud.manualUntil ?? 0) > now || this.activeLogins.size > 0) return true;
 		const sessions = this.sql
 			.exec<{ n: number }>(
-				"SELECT COUNT(*) AS n FROM sessions WHERE archived = 0 AND (busy = 1 OR (ready = 0 AND error IS NULL))",
+				`SELECT COUNT(*) AS n FROM sessions
+				 WHERE archived = 0 AND ((busy = 1 AND awaiting = 0) OR (ready = 0 AND error IS NULL))`,
 			)
 			.one().n;
 		if (sessions > 0) return true;
@@ -415,6 +452,7 @@ export class Hub extends DurableObject<Env> {
 				? { thinkingLevel: parseThinkingLevel(input.thinkingLevel || settings.defaultThinkingLevel)! }
 				: {}),
 			...(input.instructions?.trim() ? { instructions: input.instructions.trim() } : {}),
+			...(parseApprovalMode(input.approvalMode) === "ask" ? { approvalMode: "ask" as const } : {}),
 		};
 		this.sql.exec(
 			"INSERT INTO sessions (id, spec, created_at, last_activity_at) VALUES (?, ?, ?, ?)",
@@ -454,8 +492,14 @@ export class Hub extends DurableObject<Env> {
 		this.scheduleBroadcast();
 	}
 
-	/** Switches the model from the next request on; an offline session picks it up when the VM starts. */
-	async updateSessionAgent(sessionId: string, change: { model?: string; thinkingLevel?: string }): Promise<void> {
+	/**
+	 * Switches the model, thinking level or approval mode from the next request on; an offline session picks it up when
+	 * the VM starts. Switching to "auto" approves the calls already waiting.
+	 */
+	async updateSessionAgent(
+		sessionId: string,
+		change: { model?: string; thinkingLevel?: string; approvalMode?: string },
+	): Promise<void> {
 		const row = this.sql
 			.exec<{ spec: string }>("SELECT spec FROM sessions WHERE id = ? AND archived = 0", sessionId)
 			.toArray()[0];
@@ -463,9 +507,67 @@ export class Hub extends DurableObject<Env> {
 		const spec: SessionSpec = JSON.parse(row.spec) as SessionSpec;
 		if (change.model) spec.model = parseModel(change.model);
 		if (change.thinkingLevel) spec.thinkingLevel = parseThinkingLevel(change.thinkingLevel)!;
+		if (change.approvalMode !== undefined) {
+			if (parseApprovalMode(change.approvalMode) === "ask") spec.approvalMode = "ask";
+			else delete spec.approvalMode;
+		}
 		this.sql.exec("UPDATE sessions SET spec = ? WHERE id = ?", JSON.stringify(spec), sessionId);
 		this.sendToAgent({ t: "session", session: spec });
-		this.log("info", `session "${spec.title}" now uses ${spec.model.provider}/${spec.model.modelId}, thinking ${spec.thinkingLevel ?? "off"}`);
+		if (spec.approvalMode !== "ask") {
+			for (const approval of this.approvalRows(sessionId)) if (!approval.decision) this.decide(approval, true);
+		}
+		this.log(
+			"info",
+			`session "${spec.title}" now uses ${spec.model.provider}/${spec.model.modelId}, thinking ${spec.thinkingLevel ?? "off"}, approvals ${spec.approvalMode ?? "auto"}`,
+		);
+		await this.ensureAlarm(0);
+	}
+
+	private approvalRows(sessionId?: string): ApprovalRow[] {
+		return sessionId === undefined
+			? this.sql.exec<ApprovalRow>("SELECT * FROM approvals ORDER BY requested_at").toArray()
+			: this.sql.exec<ApprovalRow>("SELECT * FROM approvals WHERE session_id = ? ORDER BY requested_at", sessionId).toArray();
+	}
+
+	/** Records the answer and passes it on; without an agent online, the next VM gets it when the call asks again. */
+	private decide(approval: ApprovalRow, approve: boolean, reason?: string): void {
+		const now = Date.now();
+		this.sql.exec(
+			"UPDATE approvals SET decision = ?, reason = ?, decided_at = ? WHERE id = ?",
+			approve ? "approve" : "deny",
+			reason ?? null,
+			now,
+			approval.id,
+		);
+		// The run continues, so the session counts as working again until the agent reports otherwise.
+		this.sql.exec("UPDATE sessions SET awaiting = MAX(awaiting - 1, 0), last_activity_at = ? WHERE id = ?", now, approval.session_id);
+		this.sendToAgent({
+			t: "approval_reply",
+			sessionId: approval.session_id,
+			approvalId: approval.id,
+			approve,
+			...(reason ? { reason } : {}),
+		});
+		this.log("info", `${approve ? "approved" : "denied"} ${approval.tool_name} in session ${approval.session_id}`);
+		this.scheduleBroadcast();
+	}
+
+	async answerApproval(sessionId: string, approvalId: string, approve: boolean, reason?: string): Promise<void> {
+		const approval = this.approvalRows(sessionId).find((row) => row.id === approvalId);
+		if (!approval) throw new Error("This call no longer waits for approval.");
+		if (approval.decision) return;
+		this.decide(approval, approve, reason?.trim() || undefined);
+		await this.ensureAlarm(0);
+	}
+
+	private dropApprovals(sessionId: string): void {
+		this.sql.exec("DELETE FROM approvals WHERE session_id = ?", sessionId);
+		this.sql.exec("UPDATE sessions SET awaiting = 0 WHERE id = ?", sessionId);
+	}
+
+	/** Reconnects the session's MCP servers, rereading `mcp.json`. */
+	async reloadMcp(sessionId: string): Promise<void> {
+		if (!this.sendToAgent({ t: "mcp_reload", sessionId })) throw new Error("No VM is online. Start it first.");
 	}
 
 	/** Summarizes the session's older context now instead of waiting for automatic compaction. */
@@ -485,6 +587,7 @@ export class Hub extends DurableObject<Env> {
 
 	async abortSession(sessionId: string): Promise<void> {
 		this.sql.exec("DELETE FROM inputs WHERE session_id = ? AND acked_at IS NULL", sessionId);
+		this.dropApprovals(sessionId);
 		if (this.sendToAgent({ t: "abort", sessionId })) {
 			this.log("info", `abort sent for session ${sessionId}`);
 		} else {
@@ -500,6 +603,7 @@ export class Hub extends DurableObject<Env> {
 		this.sendToAgent({ t: "close_session", sessionId });
 		this.sql.exec("UPDATE sessions SET archived = 1, busy = 0 WHERE id = ?", sessionId);
 		this.sql.exec("DELETE FROM inputs WHERE session_id = ? AND acked_at IS NULL", sessionId);
+		this.dropApprovals(sessionId);
 		this.log("info", `session ${sessionId} archived (its files stay on the data disk)`);
 		await this.ensureAlarm(0);
 	}
@@ -556,6 +660,7 @@ export class Hub extends DurableObject<Env> {
 			this.sql.exec("DELETE FROM sessions WHERE id = ?", id);
 			this.sql.exec("DELETE FROM inputs WHERE session_id = ?", id);
 			this.sql.exec("DELETE FROM entries WHERE session_id = ?", id);
+			this.sql.exec("DELETE FROM approvals WHERE session_id = ?", id);
 			this.sql.exec("INSERT OR REPLACE INTO purges (session_id, requested_at) VALUES (?, ?)", id, now);
 		}
 		const sent = this.sendToAgent({ t: "purge", sessionIds: deleted });
@@ -578,7 +683,8 @@ export class Hub extends DurableObject<Env> {
 
 	/**
 	 * Deletes the data disk and its snapshots; the next start creates a fresh one at the configured size. Everything on
-	 * the disk goes: session state, workspaces and saved logins. Sessions are archived because they cannot continue.
+	 * the disk goes: session state, workspaces and pi's user files. Sessions are archived because they cannot continue.
+	 * Saved logins stay; the Hub keeps them.
 	 */
 	async deleteDataDisk(): Promise<void> {
 		const cloud = this.loadCloud();
@@ -601,9 +707,9 @@ export class Hub extends DurableObject<Env> {
 			current.diskIdleSince = undefined;
 			current.migration = undefined;
 		});
-		this.sql.exec("UPDATE sessions SET archived = 1 WHERE archived = 0");
+		this.sql.exec("UPDATE sessions SET archived = 1, awaiting = 0 WHERE archived = 0");
 		this.sql.exec("DELETE FROM inputs WHERE acked_at IS NULL");
-		this.sql.exec("DELETE FROM kv WHERE key = 'auth'");
+		this.sql.exec("DELETE FROM approvals");
 		this.sql.exec("DELETE FROM purges");
 		this.log("warn", `data disk ${cloud.disk?.id ?? "(none)"} and ${snapshots.length} snapshot(s) deleted; sessions archived`);
 	}
@@ -866,6 +972,7 @@ export class Hub extends DurableObject<Env> {
 					inputs: this.pendingInputs(),
 					aborts,
 					purges,
+					credentials: this.getJson<SavedCredentials | null>("credentials", null),
 				};
 				ws.send(JSON.stringify(welcome));
 				this.log("info", `agent ${instanceId} connected (v${message.agentVersion})`);
@@ -932,6 +1039,18 @@ export class Hub extends DurableObject<Env> {
 				this.putJson("auth", { providers: message.providers, models: message.models, at: now });
 				this.scheduleBroadcast();
 				return;
+			case "credentials":
+				// Secrets: stored for the next agent, never logged or shown in the panel.
+				this.putJson("credentials", message.credentials);
+				ws.send(JSON.stringify({ t: "credentials_saved", revision: message.revision } satisfies HubToAgent));
+				return;
+			case "approval_request":
+				this.onApprovalRequest(ws, message);
+				return;
+			case "approval_settled":
+				this.sql.exec("DELETE FROM approvals WHERE id = ?", message.approvalId);
+				this.scheduleBroadcast();
+				return;
 			case "login_event":
 			case "login_prompt":
 			case "login_prompt_closed":
@@ -957,6 +1076,38 @@ export class Hub extends DurableObject<Env> {
 		}
 	}
 
+	private onApprovalRequest(ws: WebSocket, message: Extract<AgentToHub, { t: "approval_request" }>): void {
+		const session = this.sql
+			.exec<{ spec: string }>("SELECT spec FROM sessions WHERE id = ? AND archived = 0", message.sessionId)
+			.toArray()[0];
+		if (!session) return;
+		const inserted = this.sql.exec(
+			"INSERT OR IGNORE INTO approvals (id, session_id, tool_name, preview, requested_at) VALUES (?, ?, ?, ?, ?)",
+			message.approvalId,
+			message.sessionId,
+			message.toolName,
+			message.preview,
+			Date.now(),
+		).rowsWritten;
+		const approval = this.approvalRows(message.sessionId).find((row) => row.id === message.approvalId)!;
+		if (approval.decision) {
+			ws.send(
+				JSON.stringify({
+					t: "approval_reply",
+					sessionId: approval.session_id,
+					approvalId: approval.id,
+					approve: approval.decision === "approve",
+					...(approval.reason ? { reason: approval.reason } : {}),
+				} satisfies HubToAgent),
+			);
+		} else if ((JSON.parse(session.spec) as SessionSpec).approvalMode !== "ask") {
+			this.decide(approval, true);
+		} else if (inserted > 0) {
+			this.log("info", `session ${message.sessionId} waits for approval of ${message.toolName}`);
+		}
+		this.scheduleBroadcast();
+	}
+
 	private agentEnv(): Record<string, string> {
 		if (!this.env.AGENT_ENV) return {};
 		try {
@@ -970,16 +1121,27 @@ export class Hub extends DurableObject<Env> {
 
 	private applyReport(report: SessionReport, now: number): void {
 		this.sql.exec(
-			`UPDATE sessions SET ready = ?, busy = ?, error = ?, cost = ?,
+			`UPDATE sessions SET ready = ?, busy = ?, error = ?, cost = ?, awaiting = ?, mcp = ?,
 			 last_activity_at = CASE WHEN ? = 1 THEN ? ELSE last_activity_at END WHERE id = ?`,
 			report.ready ? 1 : 0,
 			report.busy ? 1 : 0,
 			report.error ?? null,
 			report.costUsd ?? 0,
+			report.awaitingApproval ?? 0,
+			report.mcp ? JSON.stringify(report.mcp) : null,
 			report.busy ? 1 : 0,
 			now,
 			report.sessionId,
 		);
+		if (report.ready && !report.busy) {
+			// Nothing waits in an idle session. An unanswered request is asked again if it still matters, so only an
+			// answer is kept a while: the session may have reported before its resumed call asked again.
+			this.sql.exec(
+				"DELETE FROM approvals WHERE session_id = ? AND (decision IS NULL OR decided_at < ?)",
+				report.sessionId,
+				now - STALE_DECISION_MS,
+			);
+		}
 	}
 
 	private storeEntries(sessionId: string, events: readonly unknown[]): void {
@@ -1003,6 +1165,18 @@ export class Hub extends DurableObject<Env> {
 		const cloud = this.loadCloud();
 		const pending = new Map<string, number>();
 		for (const input of this.pendingInputs()) pending.set(input.sessionId, (pending.get(input.sessionId) ?? 0) + 1);
+		const approvals = new Map<string, ApprovalView[]>();
+		for (const row of this.approvalRows()) {
+			const list = approvals.get(row.session_id) ?? [];
+			list.push({
+				id: row.id,
+				toolName: row.tool_name,
+				preview: row.preview,
+				requestedAt: row.requested_at,
+				...(row.decision ? { decision: row.decision } : {}),
+			});
+			approvals.set(row.session_id, list);
+		}
 		const sessions: SessionView[] = this.sessionRows().map((row) => {
 			const spec = JSON.parse(row.spec) as SessionSpec;
 			return {
@@ -1011,13 +1185,16 @@ export class Hub extends DurableObject<Env> {
 				...(spec.repoUrl ? { repoUrl: spec.repoUrl } : {}),
 				model: spec.model,
 				...(spec.thinkingLevel ? { thinkingLevel: spec.thinkingLevel } : {}),
+				approvalMode: spec.approvalMode ?? "auto",
 				createdAt: row.created_at,
 				lastActivityAt: row.last_activity_at,
 				ready: row.ready === 1,
 				busy: row.busy === 1,
 				pendingInputs: pending.get(spec.id) ?? 0,
+				approvals: approvals.get(spec.id) ?? [],
 				...(row.error ? { error: row.error } : {}),
 				costUsd: row.cost,
+				...(row.mcp ? { mcp: JSON.parse(row.mcp) as McpServerStatus[] } : {}),
 			};
 		});
 		const instance = this.localMode
@@ -1241,7 +1418,13 @@ export class Hub extends DurableObject<Env> {
 				instance.phase = "draining";
 				instance.drainStartedAt = now;
 				this.sendToAgent({ t: "shutdown", reason: `idle for ${settings.idleMinutes} minutes` });
-				this.log("info", `all sessions idle; shutting down ${instance.id}`);
+				const waiting = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM sessions WHERE archived = 0 AND awaiting > 0").one().n;
+				this.log(
+					"info",
+					waiting > 0
+						? `${waiting} session(s) wait for approval and nothing else runs; shutting down ${instance.id} until you answer`
+						: `all sessions idle; shutting down ${instance.id}`,
+				);
 			}
 			return;
 		}

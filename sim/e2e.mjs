@@ -1,9 +1,10 @@
 // End-to-end lifecycle test: the real Worker (wrangler dev) against the Tencent Cloud simulator, with real agent
-// processes and the scripted faux model. Covers launch, spot reclaim mid-run, idle shutdown and sudden instance loss.
+// processes and the scripted faux model. Covers launch, spot reclaim mid-run, idle shutdown, sudden instance loss,
+// Hub-kept logins, MCP tools and approvals.
 //
 //   npm run test:e2e
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -73,17 +74,53 @@ const input = (id, content) => api(`/sessions/${id}/input`, { method: "POST", bo
 const step = (message) => console.log(`\n== ${message}`);
 
 const CONTEXT_MARKER = "E2E-GLOBAL-CONTEXT-MARKER";
+const agentDir = join(scratch, "data", "home", ".pi", "agent");
+const legacyAuthFile = join(agentDir, "auth.json");
 
-/** What pi would find in ~/.pi/agent on the data disk: a global AGENTS.md and one skill. */
+/**
+ * What pi would find in ~/.pi/agent on the data disk: a global AGENTS.md, one skill, an MCP server, and the auth.json
+ * an earlier agent saved logins to; plus a skill in ~/.agents/skills.
+ */
 function seedAgentDir() {
-	const agentDir = join(scratch, "data", "home", ".pi", "agent");
 	mkdirSync(join(agentDir, "skills", "e2e-skill"), { recursive: true });
 	writeFileSync(join(agentDir, "AGENTS.md"), `Always mention ${CONTEXT_MARKER}.\n`);
 	writeFileSync(
 		join(agentDir, "skills", "e2e-skill", "SKILL.md"),
 		"---\nname: e2e-skill\ndescription: Checks that skills reach the prompt.\n---\nDo the thing.\n",
 	);
+	const agentsSkill = join(scratch, "data", "home", ".agents", "skills", "e2e-agents-skill");
+	mkdirSync(agentsSkill, { recursive: true });
+	writeFileSync(join(agentsSkill, "SKILL.md"), "---\nname: e2e-agents-skill\ndescription: From ~/.agents/skills.\n---\n");
+	writeFileSync(
+		join(agentDir, "mcp.json"),
+		JSON.stringify({
+			mcpServers: {
+				echo: {
+					command: process.execPath,
+					args: [join(root, "sim", "mcp-echo.mjs")],
+					env: { ECHO_PREFIX: "echo: " },
+					toolExposure: { "secret-*": "hidden" },
+				},
+			},
+		}),
+	);
+	writeFileSync(
+		legacyAuthFile,
+		JSON.stringify({ faux: { type: "oauth", access: "faux-seeded", refresh: "faux-refresh", expires: Date.now() + 86_400_000 } }),
+	);
 }
+
+const fauxLogin = async (since = 0) => {
+	const { auth } = await api("/state");
+	return auth && auth.at >= since && auth.providers.find((provider) => provider.id === "faux")?.stored === "oauth";
+};
+const toolResult = async (id, name, needle) =>
+	(await api(`/sessions/${id}/transcript`)).some(
+		(e) => e.kind === "pi.tool-result" && e.model?.[0]?.toolName === name && JSON.stringify(e.model).includes(needle),
+	);
+const waitingApproval = async (id) => (await session(id))?.approvals.find((approval) => !approval.decision);
+const answer = (id, approval, approve, reason) =>
+	api(`/sessions/${id}/approval`, { method: "POST", body: JSON.stringify({ approvalId: approval.id, approve, reason }) });
 
 async function main() {
 	seedAgentDir();
@@ -119,7 +156,7 @@ async function main() {
 	step("the prompt carries pi's sections, context files and skills; subagents, compact and new context work");
 	const system = (await api(`/sessions/${created.id}/transcript`)).find((e) => e.kind === "pi.system")?.model?.[0];
 	const sections = system?.sections ?? {};
-	for (const [name, needle] of [["rules", "Use edit for precise changes"], ["project_context", CONTEXT_MARKER], ["skills", "e2e-skill"], ["tools", "subagent"]]) {
+	for (const [name, needle] of [["rules", "Use edit for precise changes"], ["project_context", CONTEXT_MARKER], ["skills", "e2e-skill"], ["skills", "e2e-agents-skill"], ["tools", "subagent"]]) {
 		if (!sections[name]?.includes(needle)) throw new Error(`system prompt section ${name} lacks "${needle}"`);
 	}
 	await input(created.id, "delegate: list the files");
@@ -130,9 +167,20 @@ async function main() {
 	await api(`/sessions/${created.id}/compact`, { method: "POST", body: JSON.stringify({ instructions: "" }) });
 	await api(`/sessions/${created.id}/reset`, { method: "POST", body: JSON.stringify({ handoff: "Continue from here." }) });
 	await waitFor("reset entry", async () => (await api(`/sessions/${created.id}/transcript`)).some((e) => e.kind === "pi.reset"), 30_000);
-	console.log("ok: pi sections, AGENTS.md and skill present; subagent answered; compact accepted; new context started");
+	console.log("ok: pi sections, AGENTS.md and skills present; subagent answered; compact accepted; new context started");
+
+	step("logins move from auth.json on the disk to the Hub; MCP tools from mcp.json are callable");
+	await waitFor("seeded login reported", () => fauxLogin(), 30_000);
+	await waitFor("auth.json removed from the disk", async () => !existsSync(legacyAuthFile), 30_000);
+	const mcp = (await session(created.id))?.mcp ?? [];
+	if (mcp[0]?.name !== "echo" || mcp[0].state !== "connected" || mcp[0].tools !== 1) throw new Error(`unexpected MCP status ${JSON.stringify(mcp)}`);
+	await input(created.id, 'mcp: mcp__echo__echo {"text":"from e2e"}');
+	await waitFor("MCP tool result", () => toolResult(created.id, "mcp__echo__echo", "echo: from e2e"), 60_000);
+	await waitFor("MCP run settled", async () => !(await session(created.id))?.busy, 30_000);
+	console.log("ok: login kept by the Hub, auth.json gone; echo server connected with its one visible tool, call answered");
 
 	step("a spot reclaim mid-run moves the work to a replacement instance");
+	const beforeAB = await answers(created.id);
 	await input(created.id, "task A");
 	await input(created.id, "task B");
 	await sleep(1000);
@@ -141,7 +189,7 @@ async function main() {
 		const agent = await runningAgent();
 		return agent && agent.id !== first.id ? agent : undefined;
 	}, 120_000);
-	await waitFor("both tasks answered", async () => (await answers(created.id)) >= 4, 90_000);
+	await waitFor("both tasks answered", async () => (await answers(created.id)) >= beforeAB + 2, 90_000);
 	console.log(`ok: replacement ${second.id} (${second.type}); interrupted tool seen: ${await interrupted(created.id)}`);
 
 	step("the instance is terminated after the idle period, then the idle disk is saved as a snapshot and deleted");
@@ -153,6 +201,7 @@ async function main() {
 	console.log("ok: no instances, no disk, one snapshot");
 
 	step("work restores the disk from its snapshot; an instance lost without notice is replaced and its run resumes");
+	const beforeC = await answers(created.id);
 	await input(created.id, "task C");
 	const third = await waitFor("agent for task C", runningAgent, 150_000);
 	if ((await simState()).disks.length !== 1) throw new Error("the data disk was not restored");
@@ -167,7 +216,8 @@ async function main() {
 		const agent = await runningAgent();
 		return agent && agent.id !== third.id ? agent : undefined;
 	}, 150_000);
-	await waitFor("task C answered", async () => (await answers(created.id)) >= 5, 90_000);
+	await waitFor("task C answered", async () => (await answers(created.id)) >= beforeC + 1, 90_000);
+	await waitFor("task C run settled", async () => !(await session(created.id))?.busy, 30_000);
 	console.log(`ok: ${third.id} lost, ${fourth.id} finished the run`);
 
 	step("Stop VM terminates the instance promptly instead of waiting for the drain timeout");
@@ -175,6 +225,45 @@ async function main() {
 	await api("/instance/stop", { method: "POST" });
 	await waitFor("instance terminated after stop", async () => (await simState()).instances.length === 0, 75_000);
 	console.log(`ok: terminated ${Math.round((Date.now() - stopRequested) / 1000)}s after Stop VM`);
+
+	step("in ask mode a shell call waits for approval; approve and deny both reach the agent");
+	const asking = await api("/sessions", { method: "POST", body: JSON.stringify({ title: "approvals", prompt: "run it", approvalMode: "ask" }) });
+	let approval = await waitFor("approval request", () => waitingApproval(asking.id), 150_000);
+	if (approval.toolName !== "bash" || !approval.preview.includes("hostname")) throw new Error(`unexpected approval ${JSON.stringify(approval)}`);
+	await answer(asking.id, approval, true);
+	await waitFor("approved call answered", async () => (await answers(asking.id)) >= 1, 60_000);
+	await input(asking.id, "run it again");
+	approval = await waitFor("second approval request", () => waitingApproval(asking.id), 60_000);
+	await answer(asking.id, approval, false, "not now");
+	await waitFor("denial reaches the model", () => toolResult(asking.id, "bash", "the user denied it: not now"), 60_000);
+	await waitFor("denied call answered", async () => (await answers(asking.id)) >= 2, 60_000);
+	console.log("ok: approved call ran; denied call was blocked with the reason");
+
+	step("a VM whose only work waits for approval stops; answering later starts a VM that finishes the call");
+	await input(asking.id, "run it a third time");
+	approval = await waitFor("third approval request", () => waitingApproval(asking.id), 60_000);
+	await waitFor("idle shutdown while waiting", async () => (await simState()).instances.length === 0, 240_000);
+	if (!(await waitingApproval(asking.id))) throw new Error("the approval request was lost when the VM stopped");
+	await answer(asking.id, approval, true);
+	await waitFor("call finished on a new VM", async () => (await answers(asking.id)) >= 3, 240_000);
+	console.log("ok: no VM while waiting; the answer given offline was applied by the next VM");
+
+	step("deleting the data disk keeps the saved logins");
+	await api("/instance/stop", { method: "POST" });
+	await waitFor("instance gone", async () => (await simState()).instances.length === 0, 120_000);
+	await waitFor("disk deletable", async () => {
+		try {
+			await api("/disk/delete", { method: "POST" });
+			return true;
+		} catch {
+			return false;
+		}
+	}, 120_000);
+	const deletedAt = Date.now();
+	await api("/instance/start", { method: "POST" });
+	await waitFor("login reported by the agent on the new disk", () => fauxLogin(deletedAt), 240_000);
+	if (existsSync(legacyAuthFile)) throw new Error("auth.json reappeared on the disk");
+	console.log("ok: a fresh disk, and the agent still has the login");
 
 	console.log("\nPASS");
 }
@@ -185,6 +274,13 @@ try {
 } catch (error) {
 	failed = true;
 	console.error(`\nFAIL: ${error.message}`);
+	const state = await api("/state").catch(() => undefined);
+	if (state) {
+		const sessions = state.sessions.map(({ id, title, ready, busy, pendingInputs, approvals, error: sessionError }) => ({
+			id, title, ready, busy, pendingInputs, approvals: approvals.length, sessionError,
+		}));
+		console.error(`sessions: ${JSON.stringify(sessions)}\ninstance: ${JSON.stringify(state.instance)}`);
+	}
 	for (const { lines } of children) console.error(lines.slice(-40).join("\n"));
 } finally {
 	stopAll();

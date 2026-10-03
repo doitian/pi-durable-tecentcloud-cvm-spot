@@ -69,6 +69,13 @@ details.tool summary { padding: 6px 10px; cursor: pointer; font: 12.5px ui-monos
 details.tool pre, details.thinking pre { margin: 0; padding: 8px 10px; background: var(--code); font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto; border-top: 1px solid var(--border); }
 details.thinking summary { color: var(--muted); cursor: pointer; font-size: 12.5px; }
 .tool .status { color: var(--muted); } .tool.err summary { color: var(--err); }
+#approvals { display: flex; flex-direction: column; gap: 8px; padding: 0 16px; max-height: 45vh; overflow-y: auto; }
+#approvals:not(:empty) { border-top: 1px solid var(--border); padding: 10px 16px; background: var(--panel); }
+.approval { border: 1px solid var(--warn); border-radius: 8px; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }
+.approval .what { font: 12.5px ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.approval pre { margin: 0; padding: 6px 8px; background: var(--code); font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; border-radius: 6px; }
+.approval .buttons { display: flex; gap: 8px; align-items: center; }
+.mcp-failed { color: var(--warn); }
 #composer { border-top: 1px solid var(--border); padding: 10px 16px; display: flex; gap: 8px; align-items: flex-end; background: var(--panel); }
 #composer textarea { min-height: 44px; max-height: 240px; }
 #composer .side { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
@@ -155,6 +162,7 @@ details.menu[open] > summary { border-color: var(--accent); }
       <label>Branch<input name="branch" placeholder="default branch"></label>
       <label>Model<input name="model" placeholder="provider/modelId" list="modelOptions"></label>
       <label>Thinking<select name="thinkingLevel"><option value="">default (Settings)</option><option>off</option><option>minimal</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label>
+      <label>Approvals<select name="approvalMode"><option value="auto">Auto: run every tool call</option><option value="ask">Ask me: approve edits, writes, shell and MCP calls</option></select></label>
       <label class="wide">Extra instructions<textarea name="instructions" rows="2"></textarea></label>
       <label class="wide">First prompt<textarea name="prompt" rows="4" placeholder="What should the agent do?"></textarea></label>
     </div>
@@ -190,7 +198,7 @@ details.menu[open] > summary { border-color: var(--accent); }
 
 <dialog id="loginsDialog">
   <h2>Model provider logins</h2>
-  <div class="msg notice">Logins run on the VM and are saved to <code>~/.pi/agent/auth.json</code> on the data disk, so they survive VM replacement. A saved login takes precedence over a key for the same provider in <code>AGENT_ENV</code>.</div>
+  <div class="msg notice">Logins run on the VM. The control panel keeps the saved credentials, not the data disk, so they survive replacing the VM and deleting the disk. A saved login takes precedence over a key for the same provider in <code>AGENT_ENV</code>.</div>
   <div id="loginsBody"></div>
   <div class="actions"><button id="loginsClose">Close</button></div>
 </dialog>
@@ -371,8 +379,11 @@ function fmtTime(ms) {
   return new Date(ms).toLocaleDateString();
 }
 
+function waitingApprovals(s) { return (s.approvals || []).filter((a) => !a.decision); }
+
 function sessionStatus(s) {
   if (s.error) return ["err", "error"];
+  if (waitingApprovals(s).length) return ["warn", "needs approval"];
   if (s.busy) return ["ok", "working"];
   if (s.pendingInputs > 0) return ["warn", "queued"];
   if (!s.ready) return ["warn", "preparing"];
@@ -428,7 +439,7 @@ function renderTopMenu() {
 }
 
 async function deleteDataDisk() {
-  if (!confirm("Delete the data disk and its snapshots?\n\nSession state, workspaces and saved logins are lost, and all sessions are archived. The next start creates a new empty disk at the size set in Settings.")) return;
+  if (!confirm("Delete the data disk and its snapshots?\n\nSession state and workspaces are lost, and all sessions are archived. Saved logins stay. The next start creates a new empty disk at the size set in Settings.")) return;
   try { await api("/disk/delete", { method: "POST" }); } catch (error) { showError(error.message); }
 }
 
@@ -467,7 +478,10 @@ function renderState() {
   }));
 
   $("#log").replaceChildren(...state.log.map((line) => h("div", { class: line.level }, `${new Date(line.at).toLocaleTimeString()} ${line.message}`)));
+  const waiting = state.sessions.reduce((n, s) => n + waitingApprovals(s).length, 0);
+  document.title = waiting ? `(${waiting}) pi spot` : "pi spot";
   renderHead();
+  renderApprovals();
 }
 
 function select(id) {
@@ -503,9 +517,11 @@ function renderView() {
   view.replaceChildren(
     h("div", { id: "viewHead" }),
     h("div", { id: "transcript" }),
+    h("div", { id: "approvals" }),
     h("div", { id: "composer" }, input, h("div", { class: "side" }, h("button", { class: "primary", onclick: send }, "Send"), h("label", { title: "Inject into the current run instead of queueing a follow-up" }, steer, "steer"))),
   );
   renderHead();
+  renderApprovals();
   renderTranscript();
 }
 
@@ -518,7 +534,9 @@ function renderHead() {
     h("span", { class: "title" }, session.title),
     modelSwitcher(session),
     thinkingSwitcher(session),
+    approvalSwitcher(session),
     h("span", { class: "meta" }, session.repoUrl ? `${session.repoUrl} · ` : "", label, session.costUsd ? ` · $${session.costUsd.toFixed(2)}` : ""),
+    mcpStatus(session),
     session.error ? h("span", { class: "meta", style: "color: var(--err)" }, session.error) : "",
     h("span", { class: "spacer" }),
     h("button", { class: "danger", title: "Stop the current run", onclick: () => api(`/sessions/${session.id}/abort`, { method: "POST" }).catch((e) => showError(e.message)) }, "Abort"),
@@ -533,6 +551,8 @@ function renderHead() {
         const handoff = prompt("Start a fresh context. Optional: a handoff note the agent starts from.", "");
         if (handoff !== null) api(`/sessions/${session.id}/reset`, { method: "POST", body: JSON.stringify({ handoff }) }).catch((e) => showError(e.message));
       } },
+      { label: "Reload MCP servers", hint: "Reread ~/.pi/agent/mcp.json and the workspace's .pi/mcp.json, then reconnect", disabled: !state.instance?.agentConnected,
+        run: () => api(`/sessions/${session.id}/mcp`, { method: "POST" }).catch((e) => showError(e.message)) },
       "-",
       { label: "Archive…", danger: true, run: () => {
         if (confirm("Archive this session? Its files stay on the data disk.")) api(`/sessions/${session.id}/archive`, { method: "POST" }).then(() => select(null));
@@ -704,6 +724,58 @@ function thinkingSwitcher(session) {
   select.value = session.thinkingLevel || "off";
   select.addEventListener("change", () => api(`/sessions/${session.id}/model`, { method: "POST", body: JSON.stringify({ thinkingLevel: select.value }) }).catch((e) => showError(e.message)));
   return select;
+}
+
+function approvalSwitcher(session) {
+  const select = h("select", { title: "Ask me: edits, writes, shell commands and MCP calls wait for your approval. Switching to auto approves what is waiting." },
+    h("option", { value: "auto" }, "approvals: auto"), h("option", { value: "ask" }, "approvals: ask me"));
+  select.value = session.approvalMode || "auto";
+  select.addEventListener("change", () => api(`/sessions/${session.id}/model`, { method: "POST", body: JSON.stringify({ approvalMode: select.value }) }).catch((e) => showError(e.message)));
+  return select;
+}
+
+function mcpStatus(session) {
+  const servers = session.mcp || [];
+  if (!servers.length) return "";
+  const tools = servers.reduce((n, server) => n + server.tools, 0);
+  const failed = servers.filter((server) => server.state === "failed");
+  const title = servers.map((server) => `${server.name}: ${server.state}, ${server.tools} tool(s)${server.error ? ` (${server.error})` : ""}`).join("\n");
+  return h("span", { class: `meta${failed.length ? " mcp-failed" : ""}`, title },
+    `MCP: ${servers.length} server(s), ${tools} tool(s)${failed.length ? `, ${failed.length} not connected` : ""}`);
+}
+
+function approvalArgs(approval) {
+  try { return JSON.parse(approval.preview); } catch { return null; }
+}
+
+function answerApproval(session, approval, approve) {
+  let reason;
+  if (!approve) {
+    reason = prompt(`Deny ${approval.toolName}? Optional: tell the agent why or what to do instead.`, "");
+    if (reason === null) return;
+  }
+  api(`/sessions/${session.id}/approval`, { method: "POST", body: JSON.stringify({ approvalId: approval.id, approve, reason }) }).catch((e) => showError(e.message));
+}
+
+function renderApprovals() {
+  const box = $("#approvals");
+  const session = currentSession();
+  if (!box || !session) return;
+  const online = !!state.instance?.agentConnected;
+  box.replaceChildren(...(session.approvals || []).map((approval) => {
+    const args = approvalArgs(approval);
+    const what = `${approval.toolName} ${argSummary(approval.toolName, args) || ""}`.slice(0, 300);
+    if (approval.decision) {
+      return h("div", { class: "msg notice" }, `${approval.decision === "approve" ? "Approved" : "Denied"}: ${what}. ${online ? "Passing it on…" : "It continues when the VM is back."}`);
+    }
+    return h("div", { class: "approval" },
+      h("div", { class: "what", title: what }, `Waiting for your approval: ${what}`),
+      h("pre", {}, approval.preview),
+      h("div", { class: "buttons" },
+        h("button", { class: "primary", onclick: () => answerApproval(session, approval, true) }, "Approve"),
+        h("button", { class: "danger", onclick: () => answerApproval(session, approval, false) }, "Deny…"),
+        h("span", { class: "msg notice" }, online ? fmtTime(approval.requestedAt) : `${fmtTime(approval.requestedAt)} · the VM stopped while waiting; answering starts it again`)));
+  }));
 }
 
 function modelSwitcher(session) {

@@ -70,8 +70,13 @@ async function api(request: Request, url: URL, env: Env): Promise<Response> {
 			return json(await stub.resetSession(id, (await body<{ handoff?: string }>()).handoff));
 		}
 		if (method === "POST" && action === "/model") {
-			return json(await stub.updateSessionAgent(id, await body<{ model?: string; thinkingLevel?: string }>()));
+			return json(await stub.updateSessionAgent(id, await body<{ model?: string; thinkingLevel?: string; approvalMode?: string }>()));
 		}
+		if (method === "POST" && action === "/approval") {
+			const answer = await body<{ approvalId: string; approve: boolean; reason?: string }>();
+			return json(await stub.answerApproval(id, answer.approvalId, answer.approve === true, answer.reason));
+		}
+		if (method === "POST" && action === "/mcp") return json(await stub.reloadMcp(id));
 		if (method === "POST" && action === "/archive") return json(await stub.archiveSession(id));
 	}
 	return json({ error: "not found" }, 404);

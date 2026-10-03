@@ -35,11 +35,11 @@ and the next start restores it (see [Lifecycle](#lifecycle)).
 | Git working trees, including uncommitted changes and stashes | `/data/work/<session-id>` | Data disk. A stale `.git/index.lock` is removed on boot. Optionally a WIP snapshot is pushed on reclaim (`"PI_WIP_PUSH": "1"` in `AGENT_ENV`). |
 | gh / git credentials | `GH_TOKEN` in the `AGENT_ENV` secret | Delivered to the agent on every connect and never written to disk. git gets it through `gh auth git-credential`. |
 | Git identity, `~/.config`, shell history | `HOME=/data/home` | Data disk. |
-| Model logins (Claude Pro/Max, ChatGPT, Copilot, API keys entered in the panel) | `/data/home/.pi/agent/auth.json` | Data disk, in pi's own format. Refreshed OAuth tokens are written back. |
+| Model logins (Claude Pro/Max, ChatGPT, Copilot, API keys entered in the panel) | Hub Durable Object | Cloudflare, in pi's `auth.json` format. Delivered to the agent on connect and kept only in its memory; refreshed OAuth tokens are sent back. Never on the data disk or in its snapshots. |
 | Model API keys from `AGENT_ENV` | `AGENT_ENV` secret | Delivered on every connect. |
 | Node.js | `/data/cache/node-*` | Downloaded once, then reused. |
-| Global `AGENTS.md` and skills | `/data/home/.pi/agent/AGENTS.md`, `/data/home/.pi/agent/skills/` | Data disk; see [What pi features the agent has](#what-pi-features-the-agent-has). |
-| Session list, queued messages, transcript mirror | Hub Durable Object | Cloudflare. Available while no VM is running. |
+| Global `AGENTS.md`, skills and MCP servers | `/data/home/.pi/agent/` (`AGENTS.md`, `skills/`, `mcp.json`), `/data/home/.agents/skills/` | Data disk; see [What pi features the agent has](#what-pi-features-the-agent-has). |
+| Session list, queued messages, approval requests and answers, transcript mirror | Hub Durable Object | Cloudflare. Available while no VM is running. |
 
 What does **not** survive: running processes (dev servers, watchers), and system packages installed with `sudo apt` on
 the system disk.
@@ -63,6 +63,7 @@ pi-durable records each tool call before running it. After a restart:
 | VM disappears without notice | The Hub finds it gone or terminating, then launches and attaches a replacement. |
 | Agent offline for 5 minutes, or never connects within 20 minutes | The Hub replaces the VM. |
 | All sessions idle for `idleMinutes` | The Hub tells the agent to shut down, then detaches the disk and terminates the VM. The disk stays. |
+| The only work left waits for approval | Counts as idle: after `idleMinutes` the VM stops. Answering starts a VM, and the call continues with your answer. |
 | Disk idle for `archiveAfterMinutes` (default 30) | 1. Snapshots the disk.<br>2. Deletes the disk once the snapshot is complete. If work arrives first, the disk is kept and the snapshot becomes the backup.<br>3. Deletes the previous snapshot once the new one is complete. While idle you pay only for the snapshot; a start takes 1–3 minutes longer. |
 | No matching spot capacity in the disk's zone for 10 minutes | 1. Snapshots the disk and creates a copy in a zone that has capacity.<br>2. Continues there.<br>3. Keeps the old disk and snapshot for you to delete. |
 
@@ -85,15 +86,60 @@ ports of it (MIT):
 | `read`, `write`, `edit`, `bash` tools | pi-durable's, the same four core tools as pi. Reading images is not supported yet. |
 | System prompt | pi's sections and tool guidance, plus rules for running on a replaceable spot VM. |
 | Context files | pi's rules: `AGENTS.override.md`, `AGENTS.md` or `CLAUDE.md` from `~/.pi/agent`, then from each directory from `/` down to the session's working directory. Re-read at most every 30 s. |
-| Skills | `~/.pi/agent/skills/` and `<repo>/.pi/skills/`, discovered and listed the way pi does; `disable-model-invocation` hides one. |
+| Skills | pi 1.0's locations and order: the workspace's `.pi/skills/`, then `.agents/skills/` in the workspace and each parent up to the repository root, then `~/.pi/agent/skills/` and `~/.agents/skills/`. The first skill of a name wins; `disable-model-invocation` hides one. |
+| MCP servers | pi's `mcp.json` files: `~/.pi/agent/mcp.json`, then the workspace's `.pi/mcp.json`. See [MCP servers](#mcp-servers). |
+| Approvals | Per session: **auto** runs every tool call; **ask me** holds edits, writes, shell commands and MCP calls until you approve them. See [Approvals](#approvals). |
 | Subagents | A `subagent` tool, as in pi's durable agent: it runs a task in a child conversation with the same tools and returns the answer. It survives a VM replacement. |
 | Compaction | Automatic, from pi-durable: background summaries near the context limit, plus one retry after a context overflow. **Compact context** in a session's **⋯** menu runs it now, with optional instructions. |
 | New context | **New context** in the **⋯** menu starts a fresh context from an optional handoff note; the history stays stored. |
 | Retries, steering, follow-ups, abort, per-session model and thinking level, cost | From pi-durable. |
-| Not available | MCP/codemode, pi extensions and packages, prompt templates, `@file` mentions, `!` commands (use the web terminal), branching (fork/tree) in the UI. |
+| Not available | codemode and tool search, MCP OAuth sign-in, pi extensions and packages, prompt templates, `@file` mentions, `!` commands (use the web terminal), branching (fork/tree) in the UI. |
 
-Put shared instructions in `~/.pi/agent/AGENTS.md` and skills in `~/.pi/agent/skills/` on the data disk; the agent
-can create them itself if you ask a session to.
+Put shared instructions in `~/.pi/agent/AGENTS.md`, skills in `~/.pi/agent/skills/` or `~/.agents/skills/`, and MCP
+servers in `~/.pi/agent/mcp.json` on the data disk (`HOME` is `/data/home`). The agent can create them itself if you
+ask a session to.
+
+### MCP servers
+
+The format is pi's (and Claude Code's, Cursor's):
+
+```json
+{
+  "mcpServers": {
+    "github": { "url": "https://api.githubcopilot.com/mcp/", "headers": { "Authorization": "Bearer ${GH_TOKEN}" } },
+    "playwright": { "command": "npx", "args": ["-y", "@playwright/mcp", "--headless"] }
+  }
+}
+```
+
+- **Transports:** stdio (`command`, `args`, `env`, `cwd`) and streamable HTTP (`url`, `headers`). SSE is not supported.
+- **Values:** `env` and `headers` values expand `${NAME}` from the agent's environment, which includes `AGENT_ENV`, or
+  run `!command` when the command is the whole value.
+- **Tool names:** `mcp__<server>__<tool>`.
+- **Exposure:** every tool is declared to the model directly. `exposure` or `toolExposure` set to `hidden` hides
+  tools; pi's codemode and tool search do not exist here, so their exposures behave like `direct`.
+- **Other options:** `timeout` (seconds, default 60) and `enabled: false` work as in pi. OAuth sign-in to remote
+  servers is not supported; put a token in `headers` instead.
+- **Connecting:** each session starts its own servers in its workspace. Before resuming, it waits up to 10 s for them,
+  so an interrupted run finds the tools it called. The session header shows how many servers and tools are connected;
+  hover it for errors.
+- **Reloading:** after changing a file, use **⋯ → Reload MCP servers**.
+
+### Approvals
+
+Each session has an approval mode, set in **New session** or in the session header:
+- **auto** (the default) runs every tool call.
+- **ask me** holds every call of `edit`, `write`, `bash` and MCP tools until you answer. `read` and `subagent` never
+  ask; a subagent's own calls do.
+
+While a call waits:
+- An **Approve** / **Deny…** card appears above the message box, and the tab title shows the count.
+- A denial can carry a reason, which the model sees.
+- Switching the session to **auto** approves everything waiting.
+
+Answers are durable. If the VM stops while a call waits, the request stays in the panel. Waiting alone does not keep
+the VM running: after `idleMinutes` it stops. Your answer starts a new VM, and the call continues there. The answer is
+recorded with the tool call, so a VM replacement never asks twice.
 
 ## Web terminal
 
@@ -125,14 +171,21 @@ In the message box, Enter sends and Shift+Enter starts a new line.
 
    For flows that redirect to `localhost`, copy the address of the page that fails to load and paste it.
 
-The credential is saved to `~/.pi/agent/auth.json` on the data disk. That is the file the `pi` CLI uses too, so you
-can also copy an existing `auth.json` there.
+The control panel keeps the credential: the Hub stores it in pi's `auth.json` format and sends it to each new agent,
+which holds it only in memory. Logins therefore survive replacing the VM and deleting the data disk, and they never
+end up in a disk snapshot.
+
+To bring an existing `pi` login over, copy its `auth.json` to `~/.pi/agent/auth.json` on the VM (with no saved logins
+in the panel yet) and restart the agent with `sudo systemctl restart pi-spot-agent`. On start, an agent moves that
+file into the Hub and deletes it from the disk. Agents from before this change saved logins there, so the first start
+after upgrading moves them the same way.
 
 How pi-durable uses it:
-- The agent builds its pi-ai `Models` with a credential store backed by that file, and every session's Harness
+- The agent builds its pi-ai `Models` with a credential store backed by the Hub's copy, and every session's Harness
   resolves auth through it on each model request.
 - A saved credential takes precedence over environment keys for the same provider.
-- OAuth tokens are refreshed when they near expiry, and the rotated tokens are written back to the disk.
+- OAuth tokens are refreshed when they near expiry. The rotated tokens go to the Hub, and are resent after a
+  reconnect until the Hub confirms them.
 
 Picking a subscription model:
 - After a login, the agent reports the models that credential can use; subscription plans may offer fewer.
@@ -259,16 +312,18 @@ A deploy only changes the agent for VMs started after it. A running VM keeps its
 
 ```bash
 npm run typecheck
-npm test            # TC3 signer matches the official SDK, instance ranking, boot script
+npm test            # TC3 signer, instance ranking, boot script, pi prompt and skills, MCP, approvals, credentials
 npm run test:e2e    # real Worker + real agent processes against a Tencent Cloud simulator
 ```
 
 `npm run test:e2e` runs `sim/tencent-sim.mjs` (a fake CVM/CBS/VPC API and metadata service whose instances are local
-agent processes) and checks four scenarios:
-- launch,
+agent processes) and checks these scenarios:
+- launch, pi's prompt, skills, subagents, compaction and new context,
+- logins moving from `auth.json` to the Hub, and an MCP tool call (`sim/mcp-echo.mjs`),
 - a spot reclaim in the middle of a run,
-- idle shutdown,
-- an instance lost without notice.
+- idle shutdown, disk archive and restore, and an instance lost without notice,
+- approve and deny in ask mode, and an approval answered while no VM runs,
+- deleting the data disk without losing logins.
 
 To try the UI without any cloud, set `CLOUD_MODE=local`, `ADMIN_TOKEN` and `LOCAL_AGENT_TOKEN` in `.dev.vars` at
 the repository root, then run `npm run dev` and start an agent next to it:
@@ -306,8 +361,8 @@ PI_HUB_URL=http://127.0.0.1:8787 PI_INSTANCE_ID=local PI_AGENT_TOKEN=<LOCAL_AGEN
 - `@earendil-works/pi-durable` is experimental and its API changes without notice. It is pinned to `1.0.0`.
 - One VM serves all sessions.
 - Tencent disks can only grow. To get a smaller disk, use **Menu → Delete data disk** while no VM exists. It deletes the
-  disk, its snapshots, session state, workspaces and saved logins, and archives all sessions; the next start creates an
-  empty disk at the size set in Settings.
+  disk, its snapshots, session state, workspaces and pi's user files (`~/.pi/agent`, `~/.agents`), and archives all
+  sessions. Saved logins stay. The next start creates an empty disk at the size set in Settings.
 - The agent can read every secret in `AGENT_ENV`, because it needs them to work. Scope tokens accordingly.
 - If the reclaim notice is missed (abrupt loss), side effects of the step in flight, such as `git push` or opening a
   PR, can happen again when the model retries. The system prompt asks it to check first.
